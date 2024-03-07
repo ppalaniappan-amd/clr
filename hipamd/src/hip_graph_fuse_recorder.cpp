@@ -212,6 +212,11 @@ bool GraphFuseRecorder::findCandidates(const std::vector<Node>& nodes) {
       fusedExecutionOrder_.back().push_back(i);
     }
 
+    if (type == hipGraphNodeTypeMemset) {
+      fusedExecutionOrder_.back().push_back(i);
+      continue;
+    }
+
     if (type != hipGraphNodeTypeKernel) {
       isRecording = false;
 

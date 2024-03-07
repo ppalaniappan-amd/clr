@@ -58,6 +58,7 @@ void FusionGroup::generateNode(void* functionHandle) {
   fusedNodeParams_.func = functionHandle;
 
   for (auto* node : fusee_) {
+    if (!node) continue;
     auto nodeParams = hip::GraphFuseRecorder::getKernelNodeParams(node);
     fusedNodeParams_.blockDim = max(fusedNodeParams_.blockDim, nodeParams.blockDim);
     fusedNodeParams_.gridDim = max(fusedNodeParams_.gridDim, nodeParams.gridDim);
@@ -210,8 +211,10 @@ std::vector<hip::GraphNode*> GraphModifier::collectNodes(const std::vector<Node>
       for (const auto& nodeNumber : group) {
         guarantee(nodeNumber == nodeCounter, "the execution order must be correct");
         auto originalNode = originalNodes[nodeNumber];
-        auto* kernelNode = dynamic_cast<hip::GraphKernelNode*>(originalNode);
-        fusionGroup->addNode(kernelNode);
+        if (originalNode->GetType() == hipGraphNodeTypeKernel) {
+          auto* kernelNode = dynamic_cast<hip::GraphKernelNode*>(originalNode);
+          fusionGroup->addNode(kernelNode);
+        }
         ++nodeCounter;
       }
       nodes.push_back(fusionGroup);
@@ -231,6 +234,13 @@ void GraphModifier::generateFusedNodes() {
 }
 
 void GraphModifier::run() {
+
+  /*{
+    int i = 0;
+    while (0 == i)
+      sleep(5);
+  }*/
+
   amd::ScopedLock lock(fclock_);
   currDescription = descriptions_[instanceId_];
 
@@ -274,5 +284,13 @@ void GraphModifier::run() {
     }
     graph_->AddNode(fusedNode);
   }
+
+  auto& updatedNodes = graph_->GetNodes();
+  for (auto node: updatedNodes) {
+    if(node->GetType() == hipGraphNodeTypeMemset) {
+      graph_->RemoveNode(node);
+    }
+  }
+
 }
 }  // namespace hip
