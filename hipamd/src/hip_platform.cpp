@@ -175,7 +175,13 @@ void __hipRegisterTexture(
 }
 
 void __hipUnregisterFatBinary(hip::FatBinaryInfo** modules) {
-  hipError_t err = PlatformState::instance().removeFatBinary(modules);
+  // By calling hipDeviceSynchronize ensure that all HSA signal handlers
+  // complete before removeFatBinary
+  hipError_t err = hipDeviceSynchronize();
+  if (err != hipSuccess) {
+    LogPrintfError("Error during hipDeviceSynchronize, error: %d", err);
+  }
+  err = PlatformState::instance().removeFatBinary(modules);
   guarantee((err == hipSuccess), "Cannot Unregister Fat Binary, error:%d", err);
 }
 
@@ -414,8 +420,14 @@ hipError_t ihipOccupancyMaxActiveBlocksPerMultiprocessor(
   // If the best block size is smaller than the block size used to fit the maximum,
   // then we need to make the grid bigger for full occupancy.
   const int bestBlocksPerCU = alu_limited_threads / (*bestBlockSize);
+  uint32_t maxCUs = device.info().maxComputeUnits_;
+  if (wrkGrpInfo->isWGPMode_ == false && device.settings().enableWgpMode_ == true) {
+    maxCUs *= 2;
+  } else if ((wrkGrpInfo->isWGPMode_ == true && device.settings().enableWgpMode_ == false)) {
+    maxCUs /= 2;
+  }
   // Unless those blocks are further constrained by LDS size.
-  *numBlocksPerGrid = device.info().maxComputeUnits_ * std::min(bestBlocksPerCU, lds_occupancy_wgs);
+  *numBlocksPerGrid = (maxCUs * std::min(bestBlocksPerCU, lds_occupancy_wgs));
 
   return hipSuccess;
 }
@@ -706,11 +718,8 @@ void PlatformState::init() {
   initialized_ = true;
   for (auto& it : statCO_.modules_) {
     hipError_t err = digestFatBinary(it.first, it.second);
-    if (err == hipErrorNoBinaryForGpu) {
+    if (err != hipSuccess) {
       HIP_ERROR_PRINT(err, "continue parsing remaining modules");
-    } else if (err != hipSuccess) {
-      HIP_ERROR_PRINT(err);
-      return;
     }
   }
   for (auto& it : statCO_.vars_) {
@@ -789,7 +798,7 @@ hipError_t PlatformState::getDynGlobalVar(const char* hostVar, hipModule_t hmod,
                                           hipDeviceptr_t* dev_ptr, size_t* size_ptr) {
   amd::ScopedLock lock(lock_);
 
-  if (hostVar == nullptr || dev_ptr == nullptr || size_ptr == nullptr) {
+  if (hostVar == nullptr) {
     return hipErrorInvalidValue;
   }
 
@@ -798,14 +807,20 @@ hipError_t PlatformState::getDynGlobalVar(const char* hostVar, hipModule_t hmod,
     LogPrintfError("Cannot find the module: 0x%x", hmod);
     return hipErrorNotFound;
   }
-  *dev_ptr = nullptr;
+  if (dev_ptr) {
+    *dev_ptr = nullptr;
+  }
   IHIP_RETURN_ONFAIL(it->second->getManagedVarPointer(hostVar, dev_ptr, size_ptr));
   // if dev_ptr is nullptr, hostvar is not in managed variable list
-  if (*dev_ptr == nullptr) {
+  if ((dev_ptr && *dev_ptr == nullptr) || (size_ptr && *size_ptr == 0)) {
     hip::DeviceVar* dvar = nullptr;
     IHIP_RETURN_ONFAIL(it->second->getDeviceVar(&dvar, hostVar));
-    *dev_ptr = dvar->device_ptr();
-    *size_ptr = dvar->size();
+    if (dev_ptr != nullptr) {
+      *dev_ptr = dvar->device_ptr();
+    }
+    if (size_ptr != nullptr) {
+      *size_ptr = dvar->size();
+    }
   }
   return hipSuccess;
 }
@@ -966,31 +981,26 @@ bool PlatformState::CloseUniqueFileHandle(const std::shared_ptr<UniqueFD>& ufd) 
   return true;
 }
 
-void PlatformState::loadExternalSymbol(const std::string& symbolName, const std::string imagePath) {
-  externalCOs_.load(symbolName, imagePath, statCO_);
-}
+void* PlatformState::getDynamicLibraryHandle() {
+  amd::ScopedLock lock(lock_);
 
-hip::ExternalCOs::SymbolTableType PlatformState::getExternalSymbolTable() {
-  return externalCOs_.getExternalTable();
-}
-
-bool PlatformState::initSemaphore() {
-  auto status = hipMalloc(&semaphore_, sizeof(size_t));
-  if (status != hipSuccess) {
-    LogPrintfError("%s", "failed to allocate semaphore on the current device");
-    return false;
+  if (dynamicLibraryHandle_ != nullptr) {
+    return dynamicLibraryHandle_;
   }
-  status = hipMemset(semaphore_, 0, sizeof(size_t));
-  if (status != hipSuccess) {
-    LogPrintfError("%s", "failed to set semaphore value on the current device");
-    return false;
-  }
-  LogPrintfInfo("%s", "semaphore is set");
-  return true;
+
+#ifdef _WIN32
+  const char* libName = "amdhip64.dll";
+#else
+  const char* libName = "libamdhip64.so";
+#endif
+
+  dynamicLibraryHandle_ = amd::Os::loadLibrary(libName);
+  return dynamicLibraryHandle_;
 }
 
-void* PlatformState::getSemaphore() {
-  guarantee(semaphore_ != nullptr, "semaphore must be initialized");
-  return semaphore_;
+void PlatformState::setDynamicLibraryHandle(void* handle){
+  amd::ScopedLock lock(lock_);
+  dynamicLibraryHandle_ = handle;
 }
+
 } //namespace hip

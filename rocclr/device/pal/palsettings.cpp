@@ -143,7 +143,9 @@ Settings::Settings() {
   alwaysResident_ = amd::IS_HIP ? true : false;
   prepinnedMinSize_ = 0;
   cpDmaCopySizeMax_ = GPU_CP_DMA_COPY_SIZE * Ki;
-  useDeviceKernelArg_ = flagIsDefault(HIP_FORCE_DEV_KERNARG) ? true : HIP_FORCE_DEV_KERNARG;
+  kernel_arg_impl_ = flagIsDefault(HIP_FORCE_DEV_KERNARG)
+                         ? KernelArgImpl::DeviceKernelArgs
+                         : HIP_FORCE_DEV_KERNARG;
 
   limit_blit_wg_ = 16;
   DEBUG_CLR_GRAPH_PACKET_CAPTURE = false; // disable graph performance optimizations for PAL
@@ -203,11 +205,6 @@ bool Settings::create(const Pal::DeviceProperties& palProp,
     case Pal::AsicRevision::Navi10_A0:
       gfx10Plus_ = true;
       useLightning_ = GPU_ENABLE_LC;
-      // Force luxmark to use HSAIL for gfx10+ if GPU_ENABLE_LC isn't set in ENV
-      if (flagIsDefault(GPU_ENABLE_LC) &&
-          (appName == "luxmark.exe" || appName == "luxmark")) {
-        useLightning_ = false;
-      }
       enableWgpMode_ = GPU_ENABLE_WGP_MODE;
       if (useLightning_) {
         enableWave32Mode_ = true;

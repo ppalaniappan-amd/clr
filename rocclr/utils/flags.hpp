@@ -194,11 +194,11 @@ release(bool, ROC_SYSTEM_SCOPE_SIGNAL, true,                                  \
         "Enable system scope for signals (uses interrupts).")                 \
 release(bool, GPU_FORCE_QUEUE_PROFILING, false,                               \
         "Force command queue profiling by default")                           \
-release(bool, HIP_MEM_POOL_SUPPORT, false,                                    \
+release(bool, HIP_MEM_POOL_SUPPORT, true,                                     \
         "Enables memory pool support in HIP")                                 \
-release(bool, HIP_MEM_POOL_USE_VM, IS_WINDOWS,                                \
+release(bool, HIP_MEM_POOL_USE_VM, true,                                      \
         "Enables memory pool support in HIP")                                 \
-release(bool, PAL_HIP_IPC_FLAG, false,                                        \
+release(bool, PAL_HIP_IPC_FLAG, true,                                         \
         "Enable interprocess flag for device allocation in PAL HIP")          \
 release(uint, PAL_FORCE_ASIC_REVISION, 0,                                     \
         "Force a specific asic revision for all devices")                     \
@@ -219,21 +219,19 @@ release(uint, ROC_P2P_SDMA_SIZE, 1024,                                        \
         "The minimum size in KB for P2P transfer with SDMA")                  \
 release(uint, ROC_AQL_QUEUE_SIZE, 16384,                                      \
         "AQL queue size in AQL packets")                                      \
-release(uint, ROC_SIGNAL_POOL_SIZE, 32,                                       \
+release(uint, ROC_SIGNAL_POOL_SIZE, 64,                                       \
         "Initial size of HSA signal pool")                                    \
 release(uint, DEBUG_CLR_LIMIT_BLIT_WG, 16,                                    \
         "Limit the number of workgroups in blit operations")                  \
+release(bool, DEBUG_CLR_BLIT_KERNARG_OPT, false,                              \
+        "Enable blit kernel arguments optimization")                          \
 release(bool, ROC_SKIP_KERNEL_ARG_COPY, false,                                \
         "If true, then runtime can skip kernel arg copy")                     \
 release(bool, GPU_STREAMOPS_CP_WAIT, false,                                   \
         "Force the stream wait memory operation to wait on CP.")              \
-release(bool, HIP_USE_RUNTIME_UNBUNDLER, false,                               \
-        "Force this to use Runtime code object unbundler.")                   \
-release(bool, HIPRTC_USE_RUNTIME_UNBUNDLER, false,                            \
-        "Set this to true to force runtime unbundler in hiprtc.")             \
 release(size_t, HIP_INITIAL_DM_SIZE, 8 * Mi,                                  \
         "Set initial heap size for device malloc.")                           \
-release(bool, HIP_FORCE_DEV_KERNARG, 0,                                       \
+release(bool, HIP_FORCE_DEV_KERNARG, true,                                    \
          "Force device mem for kernel args.")                                 \
 release(bool, DEBUG_CLR_GRAPH_PACKET_CAPTURE, true,                           \
          "Enable/Disable graph packet capturing")                             \

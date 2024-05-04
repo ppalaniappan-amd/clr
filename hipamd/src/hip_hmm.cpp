@@ -89,7 +89,7 @@ hipError_t hipMemPrefetchAsync(const void* dev_ptr, size_t count, int device,
   size_t offset = 0;
   amd::Memory* memObj = getMemoryObject(dev_ptr, offset);
 
-  if (memObj == nullptr || (memObj && count > (memObj->getSize() - offset))) {
+  if ((memObj != nullptr) && (count  > (memObj->getSize() - offset))) {
     HIP_RETURN(hipErrorInvalidValue);
   }
   if (device != hipCpuDeviceId && (static_cast<size_t>(device) >= g_devices.size())) {
@@ -232,7 +232,7 @@ hipError_t hipStreamAttachMemAsync(hipStream_t stream, void* dev_ptr,
                                    size_t length, unsigned int flags) {
   HIP_INIT_API(hipStreamAttachMemAsync, stream, dev_ptr, length, flags);
   // stream can be null, length can be 0.
-  if ((dev_ptr == nullptr)) {
+  if (dev_ptr == nullptr) {
     HIP_RETURN(hipErrorInvalidValue);
   }
 

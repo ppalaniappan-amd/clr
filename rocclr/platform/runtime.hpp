@@ -56,40 +56,19 @@ class Runtime : AllStatic {
   }
 };
 
-#if 0
-class HostThread : public Thread
-{
-private:
-    virtual void run(void* data) { ShouldNotCallThis(); }
-
-public:
-    HostThread() : Thread("HostThread", 0, false)
-    {
-        setHandle(NULL);
-        setCurrent();
-
-        if (!amd::Runtime::initialized() && !amd::Runtime::init()) {
-            return;
-        }
-
-        Os::currentStackInfo(&stackBase_, &stackSize_);
-        setState(RUNNABLE);
-    }
-
-    bool isHostThread() const { return true; };
-
-    static inline HostThread* current()
-    {
-        Thread* thread = Thread::current();
-        assert(thread->isHostThread() && "just checking");
-        return (HostThread*) thread;
-    }
-};
-#endif
-
 /*@}*/
 
 inline bool Runtime::initialized() { return initialized_; }
+
+class RuntimeTearDown : public HeapObject {
+  static std::vector<ReferenceCountedObject*> external_;
+
+public:
+  RuntimeTearDown() {}
+  ~RuntimeTearDown();
+
+  static void RegisterObject(ReferenceCountedObject* obj);
+};
 
 }  // namespace amd
 

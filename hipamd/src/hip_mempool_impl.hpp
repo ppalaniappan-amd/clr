@@ -38,21 +38,27 @@ struct SharedMemPointer {
 };
 
 struct MemoryTimestamp {
-  MemoryTimestamp(hip::Stream* stream, hip::Event* event = nullptr): event_(event) {
+  MemoryTimestamp(hip::Stream* stream = nullptr) {
     if (stream != nullptr) {
       safe_streams_.insert(stream);
     }
   }
-  MemoryTimestamp(): event_(nullptr) {}
-
   /// Adds a safe stream to the list of stream for possible reuse
-  void AddSafeStream(hip::Stream* stream) {
-    if (safe_streams_.find(stream) != safe_streams_.end()) {
-      safe_streams_.insert(stream);
+  void AddSafeStream(Stream* event_stream, Stream* wait_stream = nullptr) {
+    if (wait_stream == nullptr) {
+      if (safe_streams_.find(event_stream) == safe_streams_.end()) {
+        safe_streams_.insert(event_stream);
+      }
+    } else {
+      if (safe_streams_.find(event_stream) != safe_streams_.end()) {
+        safe_streams_.insert(wait_stream);
+      }
     }
   }
   /// Changes last known valid event asociated with memory
   void SetEvent(hip::Event* event) {
+    // Runtime will delete the HIP event, hence make sure GPU is done with it
+    Wait();
     delete event_;
     event_ = event;
   }
@@ -88,7 +94,7 @@ struct MemoryTimestamp {
   }
 
   std::unordered_set<hip::Stream*>  safe_streams_;  //!< Safe streams for memory reuse
-  hip::Event*   event_;   //!< Last known HIP event, associated with the memory object
+  hip::Event*   event_ = nullptr;   //!< Last known HIP event, associated with the memory object
 };
 
 class Heap : public amd::EmbeddedObject {
@@ -100,13 +106,14 @@ public:
   ~Heap() {}
 
   /// Adds allocation into the heap on a specific stream
-  void AddMemory(amd::Memory* memory, hip::Stream* stream);
+  void AddMemory(amd::Memory* memory, Stream* stream);
 
   /// Adds allocation into the heap with specific TS
   void AddMemory(amd::Memory* memory, const MemoryTimestamp& ts);
 
   /// Finds memory object with the specified size
-  amd::Memory* FindMemory(size_t size, hip::Stream* stream, bool opportunistic, void* dptr = nullptr);
+  amd::Memory* FindMemory(size_t size, Stream* stream, bool opportunistic,
+    void* dptr, MemoryTimestamp* ts);
 
   /// Removes allocation from the map
   bool RemoveMemory(amd::Memory* memory, MemoryTimestamp* ts = nullptr);
@@ -118,7 +125,7 @@ public:
   bool ReleaseAllMemory();
 
   /// Remove the provided stream from the safe list
-  void RemoveStream(hip::Stream* stream);
+  void RemoveStream(Stream* stream);
 
   /// Enables P2P access to the provided device
   void SetAccess(hip::Device* device, bool enable);
@@ -143,6 +150,13 @@ public:
 
   /// Erases single allocation form the heap's map
   SortedMap::iterator EraseAllocaton(SortedMap::iterator& it);
+
+  /// Add a safe stream for  quick looks-ups in all allocations
+  void AddSafeStream(Stream* event_stream, Stream* wait_stream) {
+    for (auto& it : allocations_) {
+      it.second.AddSafeStream(event_stream, wait_stream);
+    }
+  }
 
   /// Checks if memory belongs to this heap
   bool IsActiveMemory(amd::Memory* memory) const {
@@ -182,18 +196,30 @@ class MemoryPool : public amd::ReferenceCountedObject {
     SharedAccess access_[kMaxMgpuAccess]; //!< The list of devices for access
   };
 
-  MemoryPool(hip::Device* device, bool interprocess = false)
+  MemoryPool(hip::Device* device, const hipMemPoolProps* props = nullptr, bool phys_mem = false)
       : busy_heap_(device),
         free_heap_(device),
         lock_pool_ops_("Pool operations", true),
         device_(device),
-        shared_(nullptr) {
+        shared_(nullptr),
+        max_total_size_(0) {
     device_->AddMemoryPool(this);
     state_.value_ = 0;
     state_.event_dependencies_ = 1;
     state_.opportunistic_ = 1;
     state_.internal_dependencies_ = 1;
-    state_.interprocess_ = interprocess;
+    state_.phys_mem_ = HIP_MEM_POOL_USE_VM && phys_mem;
+    if (props != nullptr) {
+      properties_ = *props;
+    } else {
+      properties_ = {.allocType = hipMemAllocationTypePinned,
+                     .handleTypes = hipMemHandleTypeNone,
+                     .location = {.type = hipMemLocationTypeDevice, .id = device_->deviceId()},
+                     .win32SecurityAttributes = nullptr,
+                     .maxSize = 0,
+                     .reserved = {}};
+    }
+    state_.interprocess_ = properties_.handleTypes != hipMemHandleTypeNone;
   }
 
   virtual ~MemoryPool() {
@@ -210,10 +236,10 @@ class MemoryPool : public amd::ReferenceCountedObject {
   }
 
   /// The same stream can reuse memory without HIP event validation
-  void* AllocateMemory(size_t size, hip::Stream* stream, void* dptr = nullptr);
+  void* AllocateMemory(size_t size, Stream* stream, void* dptr = nullptr);
 
   /// Frees memory by placing memory object with HIP event into free_heap_
-  bool FreeMemory(amd::Memory* memory, hip::Stream* stream);
+  bool FreeMemory(amd::Memory* memory, Stream* stream, Event* event = nullptr);
 
   /// Check if memory is active and belongs to the busy heap
   bool IsBusyMemory(amd::Memory* memory) const { return busy_heap_.IsActiveMemory(memory); }
@@ -232,6 +258,14 @@ class MemoryPool : public amd::ReferenceCountedObject {
   void AddBusyMemory(amd::Memory* memory) {
     busy_heap_.AddMemory(memory, nullptr);
   }
+
+  /// Add a safe stream for quick looks-ups if event dependencies option is enabled
+  void AddSafeStream(Stream* event_stream, Stream* wait_stream) {
+    if (EventDependencies()) {
+      free_heap_.AddSafeStream(event_stream, wait_stream);
+    }
+  }
+
   /// Trims the pool until it has only min_bytes_to_hold
   void TrimTo(size_t min_bytes_to_hold);
 
@@ -259,12 +293,17 @@ class MemoryPool : public amd::ReferenceCountedObject {
   /// Imports memory pool from an OS specific handle
   bool Import(amd::Os::FileDesc handle);
 
+  /// Returns properties of this memory pool
+  const hipMemPoolProps& Properties() const { return properties_; }
+
   /// Accessors for the pool state
   bool EventDependencies() const { return (state_.event_dependencies_) ? true : false; }
   bool Opportunistic() const { return (state_.opportunistic_) ? true : false; }
   bool InternalDependencies() const { return (state_.internal_dependencies_) ? true : false; }
+  bool GraphInUse() const { return (state_.graph_in_use_) ? true : false; }
+  void SetGraphInUse() { state_.graph_in_use_ = true; }
 
-private:
+ private:
   MemoryPool() = delete;
   MemoryPool(const MemoryPool&) = delete;
   MemoryPool& operator=(const MemoryPool&) = delete;
@@ -277,15 +316,19 @@ private:
       uint32_t opportunistic_ : 1;          //!< HIP event check is enabled
       uint32_t internal_dependencies_ : 1;  //!< Runtime adds internal events to handle memory
                                             //!< dependencies
-      uint32_t interprocess_ : 1;  //!< Memory pool can be used in interprocess communications
+      uint32_t interprocess_ : 1;   //!< Memory pool can be used in interprocess communications
+      uint32_t graph_in_use_ : 1;   //!< Memory pool was used in a graph execution
+      uint32_t phys_mem_ : 1;       //!< Mempool is used for graphs and will have physical allocations
     };
     uint32_t value_;
   } state_;
 
-  amd::Monitor  lock_pool_ops_;  //!< Access to the pool must be lock protected
+  hipMemPoolProps properties_;  //!< Properties of the memory pool
+  amd::Monitor lock_pool_ops_;  //!< Access to the pool must be lock protected
   std::map<hip::Device*, hipMemAccessFlags> access_map_;  //!< Map of access to the pool from devices
   hip::Device*  device_;    //!< Hip device the heap will reside
   SharedMemPool* shared_;   //!< Pointer to shared memory for IPC
+  uint64_t max_total_size_; //!< Max of total reserved memory in the pool since last reset
 };
 
 

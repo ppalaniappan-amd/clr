@@ -33,13 +33,21 @@ THE SOFTWARE.
 
 namespace hiprtc {
 using namespace helpers;
+std::unordered_set<RTCLinkProgram*>RTCLinkProgram::linker_set_;
 
 std::vector<std::string> getLinkOptions(const LinkArguments& args) {
   std::vector<std::string> res;
-  auto irArgCount = args.linkerIRArgCount();
+
+  {  // process optimization level
+    std::string opt("-O");
+    opt += std::to_string(args.optimization_level_);
+    res.push_back(opt);
+  }
+
+  const auto irArgCount = args.linker_ir2isa_args_count_;
   if (irArgCount > 0) {
     res.reserve(irArgCount);
-    auto irArg = args.linkerIRArg();
+    const auto irArg = args.linker_ir2isa_args_;
     for (size_t i = 0; i < irArgCount; i++) {
       res.emplace_back(std::string(irArg[i]));
     }
@@ -393,6 +401,16 @@ RTCLinkProgram::RTCLinkProgram(std::string name) : RTCProgram(name) {
   if (amd::Comgr::create_data_set(&link_input_) != AMD_COMGR_STATUS_SUCCESS) {
     crashWithMessage("Failed to allocate internal hiprtc structure");
   }
+  amd::ScopedLock lock(lock_);
+  linker_set_.insert(this);
+}
+
+bool RTCLinkProgram::isLinkerValid(RTCLinkProgram* link_program) {
+  amd::ScopedLock lock(lock_);
+  if (linker_set_.find(link_program) == linker_set_.end()) {
+    return false;
+  }
+  return true;
 }
 
 bool RTCLinkProgram::AddLinkerOptions(unsigned int num_options, hiprtcJIT_option* options_ptr,
@@ -527,8 +545,7 @@ amd_comgr_data_kind_t RTCLinkProgram::GetCOMGRDataKind(hiprtcJITInputType input_
       data_kind = AMD_COMGR_DATA_KIND_BC;
       break;
     case HIPRTC_JIT_INPUT_LLVM_BUNDLED_BITCODE:
-      data_kind =
-          HIPRTC_USE_RUNTIME_UNBUNDLER ? AMD_COMGR_DATA_KIND_BC : AMD_COMGR_DATA_KIND_BC_BUNDLE;
+      data_kind = AMD_COMGR_DATA_KIND_BC_BUNDLE;
       break;
     case HIPRTC_JIT_INPUT_LLVM_ARCHIVES_OF_BUNDLED_BITCODE:
       data_kind = AMD_COMGR_DATA_KIND_AR_BUNDLE;
@@ -543,32 +560,13 @@ amd_comgr_data_kind_t RTCLinkProgram::GetCOMGRDataKind(hiprtcJITInputType input_
 
 bool RTCLinkProgram::AddLinkerDataImpl(std::vector<char>& link_data, hiprtcJITInputType input_type,
                                        std::string& link_file_name) {
-  std::vector<char> llvm_bitcode;
-  // If this is bundled bitcode then unbundle this.
-  if (HIPRTC_USE_RUNTIME_UNBUNDLER && input_type == HIPRTC_JIT_INPUT_LLVM_BUNDLED_BITCODE) {
-    if (!findIsa()) {
-      return false;
-    }
-
-    size_t co_offset = 0;
-    size_t co_size = 0;
-    if (!UnbundleBitCode(link_data, isa_, co_offset, co_size)) {
-      LogError("Error in hiprtc: unable to unbundle the llvm bitcode");
-      return false;
-    }
-
-    llvm_bitcode.assign(link_data.begin() + co_offset, link_data.begin() + co_offset + co_size);
-  } else {
-    llvm_bitcode.assign(link_data.begin(), link_data.end());
-  }
-
   amd_comgr_data_kind_t data_kind;
   if ((data_kind = GetCOMGRDataKind(input_type)) == AMD_COMGR_DATA_KIND_UNDEF) {
     LogError("Cannot find the correct COMGR data kind");
     return false;
   }
 
-  if (!addCodeObjData(link_input_, llvm_bitcode, link_file_name, data_kind)) {
+  if (!addCodeObjData(link_input_, link_data, link_file_name, data_kind)) {
     LogError("Error in hiprtc: unable to add linked code object");
     return false;
   }
@@ -625,7 +623,6 @@ bool RTCLinkProgram::LinkComplete(void** bin_out, size_t* size_out) {
   }
 
   std::vector<std::string> exe_options = getLinkOptions(link_args_);
-  exe_options.push_back("-O3");
   LogPrintfInfo("Exe options forwarded to compiler: %s",
                 [&]() {
                   std::string ret;
@@ -637,7 +634,7 @@ bool RTCLinkProgram::LinkComplete(void** bin_out, size_t* size_out) {
                 }()
                     .c_str());
   if (!createExecutable(exec_input_, isa_, exe_options, build_log_, executable_)) {
-    LogError("Error in hiprtc: unable to create exectuable");
+    LogPrintfInfo("Error in hiprtc: unable to create exectuable: %s", build_log_.c_str());
     return false;
   }
 

@@ -512,8 +512,10 @@ void NullDevice::fillDeviceInfo(const Pal::DeviceProperties& palProp,
   info_.errorCorrectionSupport_ = false;
 
   if (settings().apuSystem_) {
-    info_.hostUnifiedMemory_ = true;
+    info_.hostUnifiedMemory_ = 1;
   }
+
+  info_.iommuv2_ = palProp.gpuMemoryProperties.flags.iommuv2Support;
 
   info_.profilingTimerResolution_ = 1;
   info_.profilingTimerOffset_ = amd::Os::offsetToEpochNanos();
@@ -660,13 +662,19 @@ void NullDevice::fillDeviceInfo(const Pal::DeviceProperties& palProp,
 
     info_.cooperativeGroups_ = settings().enableCoopGroups_;
     info_.cooperativeMultiDeviceGroups_ = settings().enableCoopMultiDeviceGroups_;
+    // Enable StreamWrite and StreamWait for all devices
+    info_.aqlBarrierValue_ = true;
 
+#if defined(_WIN64)
     if (amd::IS_HIP) {
       info_.largeBar_ = false;
     } else if (heaps[Pal::GpuHeapInvisible].logicalSize == 0) {
       info_.largeBar_ = true;
       ClPrint(amd::LOG_INFO, amd::LOG_INIT, "Resizable bar enabled");
     }
+#else   // !_WIN64
+    info_.largeBar_ = false;
+#endif  // _WIN64
   }
   info_.virtualMemoryManagement_ = true;
   info_.virtualMemAllocGranularity_ =
@@ -1284,10 +1292,50 @@ typedef std::unordered_map<int, bool> requestedDevices_t;
 
 //! Parses the requested list of devices to be exposed to the user.
 static void parseRequestedDeviceList(const char* requestedDeviceList,
-                                     requestedDevices_t& requestedDevices, uint32_t numDevices) {
+                                     requestedDevices_t& requestedDevices, uint32_t numDevices,
+                                     Pal::IDevice* deviceList[Pal::MaxDevices]) {
   char* pch = strtok(const_cast<char*>(requestedDeviceList), ",");
   while (pch != nullptr) {
     bool deviceIdValid = true;
+    // UUID needs to be specified in the format GPU-<body>, <body> encodes UUID as a 16 chars
+    char* deviceUuid = strstr(pch, "GPU-");
+    // If Uuid is specified, then convert it to index
+    if (deviceUuid != nullptr) {
+      for (uint32_t i = 0; i < numDevices; i++) {
+        Pal::DeviceProperties properties;
+        // Retrieve device properties
+        Pal::Result result = deviceList[i]->GetProperties(&properties);
+        if (result != Pal::Result::Success) {
+          continue;
+        }
+
+        // Retrieve uuid
+        char uuid[17] = {0};
+        for (int j = 0; j < 4; j++) {
+          itoa((reinterpret_cast<char*>(&properties.pciProperties.domainNumber))[j],
+                &uuid[j], 10);
+        }
+        for (int j = 0; j < 4; j++) {
+          itoa((reinterpret_cast<char*>(&properties.pciProperties.busNumber))[j],
+                &uuid[j + 4], 10);
+        }
+        for (int j = 0; j < 4; j++) {
+          itoa((reinterpret_cast<char*>(&properties.pciProperties.deviceNumber))[j],
+                &uuid[j + 8], 10);
+        }
+        for (int j = 0; j < 4; j++) {
+          itoa((reinterpret_cast<char*>(&properties.pciProperties.functionNumber))[j],
+                &uuid[j + 12], 10);
+        }
+
+        // Convert it to index
+        if (strcmp(pch + 4, uuid) == 0) {
+          snprintf(pch, strlen(pch), "%d", i);
+          break;
+        }
+      }
+    }
+
     int currentDeviceIndex = atoi(pch);
     // Validate device index.
     for (size_t i = 0; i < strlen(pch); i++) {
@@ -1372,7 +1420,7 @@ bool Device::init() {
 
   if (requestedDeviceList[0] != '\0') {
     useDeviceList = true;
-    parseRequestedDeviceList(requestedDeviceList, requestedDevices, gNumDevices);
+    parseRequestedDeviceList(requestedDeviceList, requestedDevices, gNumDevices, &gDeviceList[0]);
   }
 
   bool foundDevice = false;
@@ -1592,13 +1640,10 @@ pal::Memory* Device::createBuffer(amd::Memory& owner, bool directAccess) const {
           // GPU will be reading from this host memory buffer,
           // so assume Host write into it
           type = Resource::RemoteUSWC;
-          remoteAlloc = true;
         } else {
-#ifndef ATI_BITS_32
           type = Resource::Remote;
-          remoteAlloc = true;
-#endif
         }
+        remoteAlloc = true;
       }
       // Make sure owner has a valid hostmem pointer and it's not COPY
       if (!remoteAlloc && (owner.getHostMem() != nullptr)) {
@@ -1970,39 +2015,80 @@ bool Device::globalFreeMemory(size_t* freeMemory) const {
   if (!(const_cast<Device*>(this)->initializeHeapResources())) {
     return false;
   }
+
+  // First, runtime calculates per process memory usage
+
   // Don't report cached memory in runtime as allocated, since allocedMem tracked at PAL calls
   Pal::gpusize local = allocedMem[Pal::GpuHeapLocal] - resourceCache().persistentCacheSize();
   Pal::gpusize invisible = allocedMem[Pal::GpuHeapInvisible] - resourceCache().lclCacheSize();
   Pal::gpusize total_alloced = local + invisible;
+  size_t cache_group_local =
+    resourceCache().persistentCacheSize() + resourceCache().lclCacheSize();
+  // Allocated system memory without cached allocations. Cache size contains all allocations, so
+  // don't count persistent and local
+  Pal::gpusize system_memory = allocedMem[Pal::GpuHeapGartCacheable] +
+    allocedMem[Pal::GpuHeapGartUswc] + cache_group_local - resourceCache().cacheSize();
+
+  // Second, query OS for overall memory usage on the system
+
+  if (properties().osProperties.supportMemoryBudgetQuery) {
+    Pal::GpuMemoryBudgetInfo mem_budget_info = {};
+    // Query OS how much memory is available
+    iDev()->QueryGpuMemoryBudgetInfo(&mem_budget_info);
+
+    Pal::gpusize system_total_alloced = mem_budget_info.usage[Pal::GpuHeapGroupLocal];
+    // Avoid possible negative values in case of alignments
+    if (mem_budget_info.usage[Pal::GpuHeapGroupLocal] > cache_group_local) {
+      system_total_alloced = mem_budget_info.usage[Pal::GpuHeapGroupLocal] - cache_group_local;
+    }
+    // System usage exceeds per process usage for device memory
+    if (system_total_alloced > total_alloced) {
+      total_alloced = system_total_alloced;
+    }
+    // Avoid possible negative values in case of extra alignments
+    if (mem_budget_info.usage[Pal::GpuHeapGroupNonLocal] >
+        (resourceCache().cacheSize() - cache_group_local)) {
+      system_total_alloced = mem_budget_info.usage[Pal::GpuHeapGroupNonLocal] +
+        cache_group_local - resourceCache().cacheSize();
+    }
+    // System usage exceeds per process usage for system memory
+    if (system_total_alloced > system_memory) {
+      system_memory = system_total_alloced;
+    }
+  }
+
+  // Third, finalize reported free memory
 
   // Fill free memory info
   freeMemory[TotalFreeMemory] = (total_alloced > info().globalMemSize_ ) ? 0 :
       static_cast<size_t>((info().globalMemSize_ - total_alloced) / Ki);
-  if (invisible >= heaps_[Pal::GpuHeapInvisible].logicalSize) {
-    invisible = 0;
-  } else {
-    invisible = heaps_[Pal::GpuHeapInvisible].logicalSize - invisible;
-  }
-  freeMemory[LargestFreeBlock] = static_cast<size_t>(invisible) / Ki;
 
   freeMemory[TotalFreeMemory] -= (freeMemory[TotalFreeMemory] > HIP_HIDDEN_FREE_MEM * Ki) ?
                                   HIP_HIDDEN_FREE_MEM * Ki : 0;
 
+  Pal::gpusize largest_block = 0;
   if (settings().apuSystem_) {
-    // Allocated system memory without cached allocations. Don't count persistent and local 
-    Pal::gpusize sysMem = allocedMem[Pal::GpuHeapGartCacheable] + allocedMem[Pal::GpuHeapGartUswc] +
-        resourceCache().persistentCacheSize() -
-        resourceCache().cacheSize() + resourceCache().lclCacheSize();
-    sysMem /= Ki;
-    if (sysMem >= freeMemory[TotalFreeMemory]) {
+    system_memory /= Ki;
+    if (system_memory >= freeMemory[TotalFreeMemory]) {
       freeMemory[TotalFreeMemory] = 0;
     } else {
-      freeMemory[TotalFreeMemory] -= sysMem;
+      freeMemory[TotalFreeMemory] -= system_memory;
     }
-    if (freeMemory[LargestFreeBlock] < freeMemory[TotalFreeMemory]) {
-      freeMemory[LargestFreeBlock] = freeMemory[TotalFreeMemory];
+    if (system_memory < heaps_[Pal::GpuHeapGartUswc].logicalSize) {
+      largest_block = heaps_[Pal::GpuHeapGartUswc].logicalSize - system_memory;
     }
   }
+
+  if (invisible < heaps_[Pal::GpuHeapInvisible].logicalSize) {
+    largest_block = std::max(largest_block, heaps_[Pal::GpuHeapInvisible].logicalSize - invisible);
+  }
+  if (local < heaps_[Pal::GpuHeapLocal].logicalSize) {
+    largest_block = std::max(largest_block, heaps_[Pal::GpuHeapLocal].logicalSize - invisible);
+  }
+
+  largest_block /= Ki;
+  freeMemory[LargestFreeBlock] = (largest_block > freeMemory[TotalFreeMemory]) ?
+    freeMemory[TotalFreeMemory] : largest_block;
 
   return true;
 }
@@ -2399,31 +2485,21 @@ void Device::svmFree(void* ptr) const {
 
 // ================================================================================================
 void* Device::virtualAlloc(void* addr, size_t size, size_t alignment) {
-  // create a hidden buffer, which will allocated on the device later
-  auto mem = new (GlbCtx()) amd::Buffer(GlbCtx(), CL_MEM_VA_RANGE_AMD, size, addr);
-  if (mem == nullptr) {
-    LogError("failed to new a va range mem object!");
-    return nullptr;
-  }
-
-  constexpr bool kSysMemAlloc = false;
-  constexpr bool kSkipAlloc = false;
-  constexpr bool kForceAlloc = true;
-  // Force the alloc now for VA_Range reservation.
-  if (!mem->create(nullptr, kSysMemAlloc, kSkipAlloc, kForceAlloc)) {
-    LogError("failed to create a va range mem object");
-    mem->release();
-    return nullptr;
-  }
-
+  amd::Memory* mem = CreateVirtualBuffer(context(), addr, size, -1, true, true);
+  assert(mem != nullptr);
   return mem->getSvmPtr();
 }
 
 // ================================================================================================
 void Device::virtualFree(void* addr) {
-  auto va = amd::MemObjMap::FindVirtualMemObj(addr);
-  if (nullptr != va) {
-    va->release();
+  auto vaddr_mem_obj = amd::MemObjMap::FindVirtualMemObj(addr);
+  if (vaddr_mem_obj == nullptr) {
+    LogPrintfError("Cannot find any mem_obj for addr: 0x%x \n", addr);
+    return;
+  }
+
+  if (!vaddr_mem_obj->getContext().devices()[0]->DestroyVirtualBuffer(vaddr_mem_obj)) {
+    LogPrintfError("Cannot destroy mem_obj:0x%x for addr: 0x%x \n", vaddr_mem_obj, addr);
   }
 }
 
@@ -2672,7 +2748,8 @@ bool Device::importExtSemaphore(void** extSemaphore, const amd::Os::FileDesc& ha
       (sem_handle_type == amd::ExternalSemaphoreHandleType::TimelineSemaphoreWin32 ||
        sem_handle_type == amd::ExternalSemaphoreHandleType::TimelineSemaphoreFd);
   palOpenInfo.flags.sharedViaNtHandle =
-      (sem_handle_type == amd::ExternalSemaphoreHandleType::OpaqueWin32);
+      (sem_handle_type == amd::ExternalSemaphoreHandleType::OpaqueWin32 ||
+       sem_handle_type == amd::ExternalSemaphoreHandleType::D3D12Fence);
   Pal::Result result;
 
   size_t semaphoreSize = iDev()->GetExternalSharedQueueSemaphoreSize(

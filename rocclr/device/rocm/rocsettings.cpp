@@ -95,14 +95,20 @@ Settings::Settings() {
   fgs_kernel_arg_ = false;
   barrier_value_packet_ = false;
 
-  host_hdp_flush_ = true;
+  kernel_arg_impl_ = KernelArgImpl::HostKernelArgs;
   gwsInitSupported_ = true;
   limit_blit_wg_ = 16;
 }
 
 // ================================================================================================
-bool Settings::create(bool fullProfile, uint32_t gfxipMajor, uint32_t gfxipMinor,
-                      uint32_t gfxStepping, bool enableXNACK, bool coop_groups) {
+bool Settings::create(bool fullProfile, const amd::Isa& isa,
+                      bool enableXNACK, bool coop_groups, 
+                      bool isXgmi, bool hasValidHDPFlush) {
+
+  uint32_t gfxipMajor = isa.versionMajor();
+  uint32_t gfxipMinor = isa.versionMinor();
+  uint32_t gfxStepping = isa.versionStepping();
+
   customHostAllocator_ = false;
 
   if (fullProfile) {
@@ -163,9 +169,9 @@ bool Settings::create(bool fullProfile, uint32_t gfxipMajor, uint32_t gfxipMinor
       (gfxStepping == 0 || gfxStepping == 1 || gfxStepping == 2)))) {
     // Enable Barrier Value packet is only for MI2XX/300
     barrier_value_packet_ = true;
-    // On MI200 and MI300, the HDP will not cache RO=0 writes, so no flush is needed
-    host_hdp_flush_ = false;
   }
+
+  setKernelArgImpl(isa, isXgmi, hasValidHDPFlush);
 
   if (gfxipMajor >= 10) {
      enableWave32Mode_ = true;
@@ -176,6 +182,7 @@ bool Settings::create(bool fullProfile, uint32_t gfxipMajor, uint32_t gfxipMinor
        imageBufferWar_ = GPU_IMAGE_BUFFER_WAR;
      }
   }
+
   if (!flagIsDefault(GPU_ENABLE_WAVE32_MODE)) {
     enableWave32Mode_ = GPU_ENABLE_WAVE32_MODE;
   }
@@ -226,6 +233,49 @@ void Settings::override() {
 
   if (!flagIsDefault(ROC_USE_FGS_KERNARG)) {
     fgs_kernel_arg_ = ROC_USE_FGS_KERNARG;
+  }
+
+  if (!flagIsDefault(DEBUG_CLR_BLIT_KERNARG_OPT)) {
+    kernel_arg_opt_ = DEBUG_CLR_BLIT_KERNARG_OPT;
+  }
+}
+
+// ================================================================================================
+void Settings::setKernelArgImpl(const amd::Isa& isa, bool isXgmi, bool hasValidHDPFlush) {
+
+  const uint32_t gfxipMajor = isa.versionMajor();
+  const uint32_t gfxipMinor = isa.versionMinor();
+  const uint32_t gfxStepping = isa.versionStepping();
+
+  const bool isMI300 = gfxipMajor == 9 && gfxipMinor == 4 &&
+      (gfxStepping == 0 || gfxStepping == 1 || gfxStepping == 2);
+  const bool isMI200 = (gfxipMajor == 9 && gfxipMinor == 0 && gfxStepping == 10);
+
+  auto kernelArgImpl = KernelArgImpl::HostKernelArgs;
+
+  if (isXgmi) {
+    // The XGMI-connected path does not require the manual memory ordering
+    // workarounds that the PCIe connected path requires
+    kernelArgImpl = KernelArgImpl::DeviceKernelArgs;
+  } else if (hasValidHDPFlush) {
+    // If the HDP flush register is valid implement the HDP flush to MMIO
+    kernelArgImpl = KernelArgImpl::DeviceKernelArgsHDP;
+  } else if (isMI300 || isMI200) {
+    // Implement the kernel argument readback workaround
+    // (write all args -> sfence -> write last byte -> mfence -> read last byte)
+    // It works only on MI200 and MI300 because of the strict guarantee on
+    // ordering of stores in those ASICS
+    kernelArgImpl = KernelArgImpl::DeviceKernelArgsReadback;
+  }
+
+  // Enable device kernel args for MI300* for now
+  if (isMI300) {
+    kernel_arg_impl_ = kernelArgImpl;
+    kernel_arg_opt_ = true;
+  }
+
+  if (!flagIsDefault(HIP_FORCE_DEV_KERNARG)) {
+    kernel_arg_impl_ = kernelArgImpl & (HIP_FORCE_DEV_KERNARG ? 0xF : 0x0);
   }
 }
 }  // namespace roc

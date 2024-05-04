@@ -114,7 +114,7 @@ Memory::Memory(Memory& parent, Flags flags, size_t origin, size_t size, Type typ
       flags_(flags),
       version_(parent.getVersion()),
       lastWriter_(parent.getLastWriter()),
-      interopObj_(nullptr),
+      interopObj_(amd::IS_HIP ? nullptr : parent.getInteropObj()),
       vDev_(NULL),
       mapCount_(0),
       svmHostAddress_(parent.getSvmPtr()),
@@ -320,10 +320,7 @@ bool Memory::create(void* initFrom, bool sysMemAlloc, bool skipAlloc, bool force
       }
     }
   }
-  // Add a VA range into VA range map
-  if (getMemFlags() & CL_MEM_VA_RANGE_AMD) {
-    amd::MemObjMap::AddVirtualMemObj(getSvmPtr(), this);
-  }
+
   // Store the unique id for each memory allocation
   uniqueId_ = ++numAllocs;
   return true;
@@ -541,6 +538,11 @@ void Memory::uncommitSvmMemory() {
     amd::Os::uncommitMemory(svmHostAddress_, size_);
     svmPtrCommited_ = false;
   }
+}
+
+Device* Memory::GetDeviceById() {
+  size_t device_idx = (userData_.deviceId < getContext().devices().size()) ? userData_.deviceId : 0;
+  return getContext().devices()[device_idx];
 }
 
 void Buffer::initDeviceMemory() {
@@ -1524,7 +1526,6 @@ bool SvmBuffer::Contains(uintptr_t ptr) {
 // The allocation flags are ignored for now.
 void* SvmBuffer::malloc(Context& context, cl_svm_mem_flags flags, size_t size, size_t alignment,
                         const amd::Device* curDev) {
-  bool atomics = (flags & CL_MEM_SVM_ATOMICS) != 0;
   void* ret = context.svmAlloc(size, alignment, flags, curDev);
   if (ret == nullptr) {
     LogError("Unable to allocate aligned memory");

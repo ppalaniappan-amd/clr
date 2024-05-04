@@ -1,4 +1,4 @@
-/* Copyright (c) 2015 - 2021 Advanced Micro Devices, Inc.
+/* Copyright (c) 2015 - 2024 Advanced Micro Devices, Inc.
 
  Permission is hereby granted, free of charge, to any person obtaining a copy
  of this software and associated documentation files (the "Software"), to deal
@@ -66,10 +66,6 @@ hipError_t hipModuleLoadDataEx(hipModule_t* module, const void* image, unsigned 
   HIP_RETURN(PlatformState::instance().loadModule(module, 0, image));
 }
 
-extern hipError_t __hipExtractCodeObjectFromFatBinary(
-    const void* data, const std::vector<std::string>& devices,
-    std::vector<std::pair<const void*, size_t>>& code_objs);
-
 hipError_t hipModuleGetFunction(hipFunction_t* hfunc, hipModule_t hmod, const char* name) {
   HIP_INIT_API(hipModuleGetFunction, hfunc, hmod, name);
 
@@ -92,10 +88,6 @@ hipError_t hipModuleGetGlobal(hipDeviceptr_t* dptr, size_t* bytes, hipModule_t h
                               const char* name) {
   HIP_INIT_API(hipModuleGetGlobal, dptr, bytes, hmod, name);
 
-  if (dptr == nullptr || bytes == nullptr) {
-    // If either is nullptr, ignore it
-    HIP_RETURN(hipSuccess);
-  }
   if ((dptr == nullptr && bytes == nullptr) || name == nullptr || strlen(name) == 0) {
     HIP_RETURN(hipErrorInvalidValue);
   }
@@ -115,7 +107,7 @@ hipError_t hipModuleGetGlobal(hipDeviceptr_t* dptr, size_t* bytes, hipModule_t h
 hipError_t hipFuncGetAttribute(int* value, hipFunction_attribute attrib, hipFunction_t hfunc) {
   HIP_INIT_API(hipFuncGetAttribute, value, attrib, hfunc);
 
-  if ((value == nullptr)) {
+  if (value == nullptr) {
     HIP_RETURN(hipErrorInvalidValue);
   }
 
@@ -656,7 +648,19 @@ hipError_t hipModuleLaunchCooperativeKernelMultiDevice(hipFunctionLaunchParams* 
 
 }
 
- hipError_t hipLaunchKernel_common(const void* hostFunction, dim3 gridDim, dim3 blockDim,
+hipError_t hipGetFuncBySymbol(hipFunction_t* functionPtr, const void* symbolPtr) {
+  HIP_INIT_API(hipGetFuncBySymbol, functionPtr, symbolPtr);
+
+  hipError_t hip_error = PlatformState::instance().getStatFunc(functionPtr,
+                         symbolPtr, ihipGetDevice());
+
+  if ((hip_error != hipSuccess) || (functionPtr == nullptr)) {
+    HIP_RETURN(hipErrorInvalidDeviceFunction);
+  }
+  HIP_RETURN(hipSuccess);
+}
+
+hipError_t hipLaunchKernel_common(const void* hostFunction, dim3 gridDim, dim3 blockDim,
                                              void** args, size_t sharedMemBytes,
                                              hipStream_t stream) {
   STREAM_CAPTURE(hipLaunchKernel, stream, hostFunction, gridDim, blockDim, args, sharedMemBytes);
@@ -664,7 +668,7 @@ hipError_t hipModuleLaunchCooperativeKernelMultiDevice(hipFunctionLaunchParams* 
                           nullptr, 0);
 }
 
- hipError_t hipLaunchKernel(const void* hostFunction, dim3 gridDim, dim3 blockDim,
+hipError_t hipLaunchKernel(const void* hostFunction, dim3 gridDim, dim3 blockDim,
                                       void** args, size_t sharedMemBytes, hipStream_t stream) {
   HIP_INIT_API(hipLaunchKernel, hostFunction, gridDim, blockDim, args, sharedMemBytes, stream);
   HIP_RETURN(hipLaunchKernel_common(hostFunction, gridDim, blockDim, args, sharedMemBytes, stream));
@@ -697,7 +701,11 @@ hipError_t hipLaunchCooperativeKernel_common(const void* f, dim3 gridDim, dim3 b
                                              void** kernelParams, uint32_t sharedMemBytes,
                                              hipStream_t hStream) {
   if (!hip::isValid(hStream)) {
-    return hipErrorInvalidValue;
+    return hipErrorContextIsDestroyed;
+  }
+
+  if (f == nullptr) {
+    return hipErrorInvalidDeviceFunction;
   }
 
   hipFunction_t func = nullptr;
@@ -715,6 +723,10 @@ hipError_t hipLaunchCooperativeKernel_common(const void* f, dim3 gridDim, dim3 b
       globalWorkSizeZ > std::numeric_limits<uint32_t>::max() ||
       (blockDim.x * blockDim.y * blockDim.z > device->info().maxWorkGroupSize_)) {
     return hipErrorInvalidConfiguration;
+  }
+
+  if (sharedMemBytes > device->info().localMemSizePerCU_) {
+    return hipErrorCooperativeLaunchTooLarge;
   }
 
   return ihipModuleLaunchKernel(func, static_cast<uint32_t>(globalWorkSizeX),
