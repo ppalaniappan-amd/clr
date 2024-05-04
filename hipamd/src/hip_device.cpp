@@ -23,6 +23,7 @@
 
 #include "hip_internal.hpp"
 #include "hip_mempool_impl.hpp"
+#include "hip_platform.hpp"
 
 #undef hipGetDeviceProperties
 #undef hipDeviceProp_t
@@ -32,15 +33,17 @@ namespace hip {
 // ================================================================================================
 hip::Stream* Device::NullStream(bool wait) {
   if (null_stream_ == nullptr) {
-    null_stream_ = new Stream(this, Stream::Priority::Normal, 0, true);
+    amd::ScopedLock lock(lock_);
+    if (null_stream_ == nullptr) {
+      null_stream_ = new Stream(this, Stream::Priority::Normal, 0, true);
+    }
   }
-
   if (null_stream_ == nullptr) {
     return nullptr;
   }
   if (wait == true) {
     // Wait for all active streams before executing commands on the default
-    iHipWaitActiveStreams(null_stream_);
+    WaitActiveStreams(null_stream_);
   }
   return null_stream_;
 }
@@ -54,7 +57,7 @@ bool Device::Create() {
   }
 
   // Create graph memory pool
-  graph_mem_pool_ = new MemoryPool(this);
+  graph_mem_pool_ = new MemoryPool(this, nullptr, true);
   if (graph_mem_pool_ == nullptr) {
     return false;
   }
@@ -69,6 +72,13 @@ bool Device::Create() {
   // Current is default pool after device creation
   current_mem_pool_ = default_mem_pool_;
   return true;
+}
+
+// ================================================================================================
+bool Device::IsMemoryPoolValid(MemoryPool* pool) {
+  amd::ScopedLock lock(lock_);
+  bool result = (mem_pools_.find(pool) != mem_pools_.end()) ? true : false;
+  return result;
 }
 
 // ================================================================================================
@@ -88,11 +98,11 @@ void Device::RemoveMemoryPool(MemoryPool* pool) {
 }
 
 // ================================================================================================
-bool Device::FreeMemory(amd::Memory* memory, Stream* stream) {
+bool Device::FreeMemory(amd::Memory* memory, Stream* stream, Event* event) {
   amd::ScopedLock lock(lock_);
   // Search for memory in the entire list of pools
   for (auto it : mem_pools_) {
-    if (it->FreeMemory(memory, stream)) {
+    if (it->FreeMemory(memory, stream, event)) {
       return true;
     }
   }
@@ -118,6 +128,15 @@ void Device::RemoveStreamFromPools(Stream* stream) {
 }
 
 // ================================================================================================
+void Device::AddSafeStream(Stream* event_stream, Stream* wait_stream) {
+  amd::ScopedLock lock(lock_);
+  // Update all pools with the safe streams
+  for (auto it : mem_pools_) {
+    it->AddSafeStream(event_stream, wait_stream);
+  }
+}
+
+// ================================================================================================
 void Device::Reset() {
   {
     amd::ScopedLock lock(lock_);
@@ -130,9 +149,148 @@ void Device::Reset() {
     mem_pools_.clear();
   }
   flags_ = hipDeviceScheduleSpin;
-  hip::Stream::destroyAllStreams(deviceId_);
+  destroyAllStreams();
   amd::MemObjMap::Purge(devices()[0]);
   Create();
+}
+
+// ================================================================================================
+void Device::WaitActiveStreams(hip::Stream* blocking_stream, bool wait_null_stream) {
+  amd::Command::EventWaitList eventWaitList(0);
+  bool submitMarker = 0;
+
+  auto waitForStream = [&submitMarker,
+                         &eventWaitList](hip::Stream* stream) {
+    if (amd::Command *command = stream->getLastQueuedCommand(true)) {
+      amd::Event &event = command->event();
+      // Check HW status of the ROCcrl event.
+      // Note: not all ROCclr modes support HW status
+      bool ready = stream->device().IsHwEventReady(event);
+      if (!ready) {
+        ready = (command->status() == CL_COMPLETE);
+      }
+      submitMarker |= stream->vdev()->isFenceDirty();
+      // Check the current active status
+      if (!ready) {
+        command->notifyCmdQueue();
+        eventWaitList.push_back(command);
+      } else {
+        command->release();
+      }
+    }
+  };
+
+  if (wait_null_stream) {
+    if (null_stream_) {
+      waitForStream(null_stream_);
+    }
+  } else {
+    amd::ScopedLock lock(streamSetLock);
+
+    for (const auto& active_stream : streamSet) {
+      // If it's the current device
+      if (// Make sure it's a default stream
+        ((active_stream->Flags() & hipStreamNonBlocking) == 0) &&
+        // and it's not the current stream
+        (active_stream != blocking_stream)) {
+        // Get the last valid command
+        waitForStream(active_stream);
+      }
+    }
+  }
+
+  // Check if we have to wait anything
+  if (eventWaitList.size() > 0 || submitMarker) {
+    amd::Command* command = new amd::Marker(*blocking_stream, kMarkerDisableFlush, eventWaitList);
+    if (command != nullptr) {
+      command->enqueue();
+      command->release();
+    }
+  }
+
+  // Release all active commands. It's safe after the marker was enqueued
+  for (const auto& it : eventWaitList) {
+    it->release();
+  }
+}
+
+// ================================================================================================
+void Device::AddStream(Stream* stream) {
+  amd::ScopedLock lock(streamSetLock);
+  streamSet.insert(stream);
+}
+
+// ================================================================================================
+void Device::RemoveStream(Stream* stream){
+  amd::ScopedLock lock(streamSetLock);
+  streamSet.erase(stream);
+}
+
+// ================================================================================================
+bool Device::StreamExists(Stream* stream){
+  amd::ScopedLock lock(streamSetLock);
+  if (streamSet.find(stream) != streamSet.end()) {
+    return true;
+  }
+  return false;
+}
+
+// ================================================================================================
+void Device::destroyAllStreams() {
+  std::vector<Stream*> toBeDeleted;
+  {
+    amd::ScopedLock lock(streamSetLock);
+    for (auto& it : streamSet) {
+      if (it->Null() == false ) {
+        toBeDeleted.push_back(it);
+      }
+    }
+  }
+  for (auto& it : toBeDeleted) {
+    hip::Stream::Destroy(it);
+  }
+}
+
+// ================================================================================================
+void Device::SyncAllStreams( bool cpu_wait) {
+  // Make a local copy to avoid stalls for GPU finish with multiple threads
+  std::vector<hip::Stream*> streams;
+  streams.reserve(streamSet.size());
+  {
+    amd::ScopedLock lock(streamSetLock);
+    for (auto it : streamSet) {
+      streams.push_back(it);
+      it->retain();
+    }
+  }
+  for (auto it : streams) {
+    it->finish(cpu_wait);
+    it->release();
+  }
+  // Release freed memory for all memory pools on the device
+  ReleaseFreedMemory();
+}
+
+// ================================================================================================
+bool Device::StreamCaptureBlocking() {
+  amd::ScopedLock lock(streamSetLock);
+  for (auto& it : streamSet) {
+    if (it->GetCaptureStatus() == hipStreamCaptureStatusActive && it->Flags() != hipStreamNonBlocking) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ================================================================================================
+bool Device::existsActiveStreamForDevice() {
+  amd::ScopedLock lock(streamSetLock);
+  for (const auto& active_stream : streamSet) {
+    if (active_stream->GetQueueStatus()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // ================================================================================================
@@ -399,8 +557,8 @@ hipError_t ihipGetDeviceProperties(hipDeviceProp_tR0600* props, int device) {
   deviceProps.directManagedMemAccessFromHost = info.hmmDirectHostAccess_;
   deviceProps.canUseHostPointerForRegisteredMem = info.hostUnifiedMemory_;
   deviceProps.pageableMemoryAccess = info.hmmCpuMemoryAccessible_;
-  deviceProps.hostRegisterSupported = info.hostUnifiedMemory_;
-  deviceProps.pageableMemoryAccessUsesHostPageTables = info.hostUnifiedMemory_;
+  deviceProps.hostRegisterSupported = true;
+  deviceProps.pageableMemoryAccessUsesHostPageTables = info.iommuv2_;
 
   // Mem pool
   deviceProps.memoryPoolsSupported = HIP_MEM_POOL_SUPPORT;
@@ -465,7 +623,7 @@ hipError_t ihipGetDeviceProperties(hipDeviceProp_tR0600* props, int device) {
   deviceProps.timelineSemaphoreInteropSupported = 0;
   deviceProps.unifiedFunctionPointers = 0;
 
-  deviceProps.integrated = info.accelerator_;
+  deviceProps.integrated = info.hostUnifiedMemory_;
 
   *props = deviceProps;
   return hipSuccess;
@@ -579,6 +737,44 @@ hipError_t hipGetDevicePropertiesR0000(hipDeviceProp_tR0000* prop, int device) {
   deviceProps.pageableMemoryAccessUsesHostPageTables = info.hostUnifiedMemory_;
 
   *prop = deviceProps;
+  HIP_RETURN(hipSuccess);
+}
+
+hipError_t hipGetProcAddress(const char* symbol, void** pfn, int hipVersion, uint64_t flags,
+                             hipDriverProcAddressQueryResult* symbolStatus) {
+  HIP_INIT_API(hipGetProcAddress, symbol, pfn, hipVersion, flags, symbolStatus);
+
+  std::string symbolString = symbol;
+  if(symbol == nullptr || symbolString == "" || pfn == nullptr){
+    HIP_RETURN(hipErrorInvalidValue);
+  }
+
+  if (symbolString == "hipGetDeviceProperties"){
+    if (hipVersion >= 600){
+      symbolString = "hipGetDevicePropertiesR0600";
+    }
+  } else if (symbolString == "hipChooseDevice") {
+    if (hipVersion >= 600){
+      symbolString = "hipChooseDeviceR0600";
+    }
+  }
+
+  void* handle = hip::PlatformState::instance().getDynamicLibraryHandle();
+  if (handle == nullptr){
+    HIP_RETURN(hipErrorInvalidValue);
+  }
+
+  *pfn = amd::Os::getSymbol(handle, symbolString.c_str());
+  if (!(*pfn)) {
+    if (symbolStatus != nullptr) {
+      *symbolStatus = HIP_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND;
+    }
+    HIP_RETURN(hipErrorInvalidValue);
+  }
+
+  if (symbolStatus != nullptr) {
+    *symbolStatus = HIP_GET_PROC_ADDRESS_SUCCESS;
+  }
   HIP_RETURN(hipSuccess);
 }
 

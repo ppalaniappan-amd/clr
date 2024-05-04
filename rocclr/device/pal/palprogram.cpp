@@ -139,10 +139,10 @@ bool Segment::alloc(HSAILProgram& prog, amdgpu_hsa_elf_segment_t segment, size_t
 
 void Segment::copy(size_t offset, const void* src, size_t size) {
   if (cpuAccess_ != nullptr) {
-    amd::Os::fastMemcpy(cpuAddress(offset), src, size);
+    std::memcpy(cpuAddress(offset), src, size);
   } else {
     if (cpuMem_ != nullptr) {
-      amd::Os::fastMemcpy(cpuAddress(offset), src, size);
+      std::memcpy(cpuAddress(offset), src, size);
     }
     amd::ScopedLock k(gpuAccess_->dev().xferMgr().lockXfer());
     VirtualGPU& gpu = *gpuAccess_->dev().xferQueue();
@@ -568,7 +568,7 @@ void* PALHSALoaderContext::SegmentAlloc(amdgpu_hsa_elf_segment_t segment, hsa_ag
 bool PALHSALoaderContext::SegmentCopy(amdgpu_hsa_elf_segment_t segment, hsa_agent_t agent,
                                       void* dst, size_t offset, const void* src, size_t size) {
   if (program_->isNull()) {
-    amd::Os::fastMemcpy(reinterpret_cast<address>(dst) + offset, src, size);
+    std::memcpy(reinterpret_cast<address>(dst) + offset, src, size);
     return true;
   }
   Segment* s = reinterpret_cast<Segment*>(dst);
@@ -762,7 +762,9 @@ bool LightningProgram::createKernels(void* binary, size_t binSize, bool useUnifo
       }
       kernels()[kernelName] = kernel;
 
-      kernel->setUniformWorkGroupSize(useUniformWorkGroupSize);
+      if (codeObjectVer() < 5) {
+        kernel->setUniformWorkGroupSize(useUniformWorkGroupSize);
+      }
     }
   }
   executable_ = loader_->CreateExecutable(HSA_PROFILE_FULL, nullptr);
@@ -782,7 +784,13 @@ bool LightningProgram::createKernels(void* binary, size_t binSize, bool useUnifo
     return false;
   }
 
-  status = loader_->FreezeExecutable(executable_, nullptr);
+  if (isInternal() && (owner()->language() == amd::Program::Assembly)) {
+    // Don't register trap handler with the debugger, since user shouldn't see this kernel
+    status = executable_->Freeze(nullptr);
+    trapHandler_ = true;
+  } else {
+    status = loader_->FreezeExecutable(executable_, nullptr);
+  }
   if (status != HSA_STATUS_SUCCESS) {
     LogError("Error: Freezing the executable failed.");
     return false;
@@ -795,8 +803,8 @@ bool LightningProgram::createKernels(void* binary, size_t binSize, bool useUnifo
 bool LightningProgram::setKernels(void* binary, size_t binSize, amd::Os::FileDesc fdesc,
                                   size_t foffset, std::string uri) {
 #if defined(USE_COMGR_LIBRARY)
-  // Collect the information about compiled binary
-  if (!isNull() && (palDevice().rgpCaptureMgr() != nullptr)) {
+  // Collect the information about compiled binary, except the trap handler
+  if (!isNull() && (palDevice().rgpCaptureMgr() != nullptr) && !isTrapHandler()) {
     apiHash_ = palDevice().rgpCaptureMgr()->AddElfBinary(
         binary, binSize, binary, binSize, codeSegGpu_->iMem(), codeSegGpu_->offset());
   }

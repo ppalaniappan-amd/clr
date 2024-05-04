@@ -1,5 +1,5 @@
 /*
-    Copyright (c) 2023 Advanced Micro Devices, Inc. All rights reserved.
+    Copyright (c) 2023 - 2024 Advanced Micro Devices, Inc. All rights reserved.
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to deal
@@ -290,6 +290,8 @@ hipError_t hipGraphInstantiate(hipGraphExec_t* pGraphExec, hipGraph_t graph,
                                hipGraphNode_t* pErrorNode, char* pLogBuffer, size_t bufferSize);
 hipError_t hipGraphInstantiateWithFlags(hipGraphExec_t* pGraphExec, hipGraph_t graph,
                                         unsigned long long flags);
+hipError_t hipGraphInstantiateWithParams(hipGraphExec_t* pGraphExec, hipGraph_t graph,
+                                         hipGraphInstantiateParams* instantiateParams);
 hipError_t hipGraphKernelNodeCopyAttributes(hipGraphNode_t hSrc, hipGraphNode_t hDst);
 hipError_t hipGraphKernelNodeGetAttribute(hipGraphNode_t hNode, hipKernelNodeAttrID attr,
                                           hipKernelNodeAttrValue* value);
@@ -757,6 +759,22 @@ hipError_t hipGraphExternalSemaphoresWaitNodeSetParams(
 hipError_t hipModuleLaunchCooperativeKernelMultiDevice(hipFunctionLaunchParams* launchParamsList,
                                                        unsigned int numDevices, unsigned int flags);
 hipError_t hipExtGetLastError();
+hipError_t hipTexRefGetBorderColor(float* pBorderColor, const textureReference* texRef);
+hipError_t hipTexRefGetArray(hipArray_t* pArray, const textureReference* texRef);
+hipError_t hipGetProcAddress(const char* symbol, void** pfn, int hipVersion, uint64_t flags,
+                             hipDriverProcAddressQueryResult* symbolStatus);
+hipError_t hipStreamBeginCaptureToGraph(hipStream_t stream, hipGraph_t graph,
+                                        const hipGraphNode_t* dependencies,
+                                        const hipGraphEdgeData* dependencyData,
+                                        size_t numDependencies, hipStreamCaptureMode mode);
+hipError_t hipGetFuncBySymbol(hipFunction_t* functionPtr, const void* symbolPtr);
+hipError_t hipDrvGraphAddMemFreeNode(hipGraphNode_t* phGraphNode, hipGraph_t hGraph,
+                                  const hipGraphNode_t* dependencies, size_t numDependencies,
+                                  hipDeviceptr_t dptr);
+hipError_t hipDrvGraphExecMemcpyNodeSetParams(hipGraphExec_t hGraphExec, hipGraphNode_t hNode,
+                                   const HIP_MEMCPY3D* copyParams, hipCtx_t ctx);
+hipError_t hipDrvGraphExecMemsetNodeSetParams(hipGraphExec_t hGraphExec, hipGraphNode_t hNode,
+                                   const HIP_MEMSET_NODE_PARAMS* memsetParams, hipCtx_t ctx);
 }  // namespace hip
 
 namespace hip {
@@ -942,6 +960,7 @@ void UpdateDispatchTable(HipDispatchTable* ptrDispatchTable) {
   ptrDispatchTable->hipGraphHostNodeSetParams_fn = hip::hipGraphHostNodeSetParams;
   ptrDispatchTable->hipGraphInstantiate_fn = hip::hipGraphInstantiate;
   ptrDispatchTable->hipGraphInstantiateWithFlags_fn = hip::hipGraphInstantiateWithFlags;
+  ptrDispatchTable->hipGraphInstantiateWithParams_fn = hip::hipGraphInstantiateWithParams;
   ptrDispatchTable->hipGraphKernelNodeCopyAttributes_fn = hip::hipGraphKernelNodeCopyAttributes;
   ptrDispatchTable->hipGraphKernelNodeGetAttribute_fn = hip::hipGraphKernelNodeGetAttribute;
   ptrDispatchTable->hipGraphKernelNodeGetParams_fn = hip::hipGraphKernelNodeGetParams;
@@ -1227,15 +1246,22 @@ void UpdateDispatchTable(HipDispatchTable* ptrDispatchTable) {
   ptrDispatchTable->hipDrvGraphAddMemsetNode_fn = hip::hipDrvGraphAddMemsetNode;
   ptrDispatchTable->hipGetDevicePropertiesR0000_fn = hip::hipGetDevicePropertiesR0000;
   ptrDispatchTable->hipExtGetLastError_fn = hip::hipExtGetLastError;
+  ptrDispatchTable->hipTexRefGetBorderColor_fn =  hip::hipTexRefGetBorderColor;
+  ptrDispatchTable->hipTexRefGetArray_fn = hip::hipTexRefGetArray;
+  ptrDispatchTable->hipGetProcAddress_fn = hip::hipGetProcAddress;
+  ptrDispatchTable->hipStreamBeginCaptureToGraph_fn = hip::hipStreamBeginCaptureToGraph;
+  ptrDispatchTable->hipGetFuncBySymbol_fn = hip::hipGetFuncBySymbol;
+  ptrDispatchTable->hipDrvGraphAddMemFreeNode_fn = hip::hipDrvGraphAddMemFreeNode;
+  ptrDispatchTable->hipDrvGraphExecMemcpyNodeSetParams_fn = hip::hipDrvGraphExecMemcpyNodeSetParams;
+  ptrDispatchTable->hipDrvGraphExecMemsetNodeSetParams_fn = hip::hipDrvGraphExecMemsetNodeSetParams;
 }
 
 #if HIP_ROCPROFILER_REGISTER > 0
 template <typename Tp> struct dispatch_table_info;
 
-#define HIP_DEFINE_DISPATCH_TABLE_INFO(TYPE, NAME, NUM_FUNCTORS)                                   \
+#define HIP_DEFINE_DISPATCH_TABLE_INFO(TYPE, NAME)                                                 \
   template <> struct dispatch_table_info<TYPE> {                                                   \
     static constexpr auto name = #NAME;                                                            \
-    static constexpr auto size = ComputeTableSize(NUM_FUNCTORS);                                   \
     static constexpr auto version = HIP_ROCP_REG_VERSION;                                          \
     static constexpr auto import_func = &ROCPROFILER_REGISTER_IMPORT_FUNC(NAME);                   \
   };
@@ -1244,8 +1270,8 @@ constexpr auto ComputeTableSize(size_t num_funcs) {
   return (num_funcs * sizeof(void*)) + sizeof(uint64_t);
 }
 
-HIP_DEFINE_DISPATCH_TABLE_INFO(HipDispatchTable, hip, 429)
-HIP_DEFINE_DISPATCH_TABLE_INFO(HipCompilerDispatchTable, hip_compiler, 9)
+HIP_DEFINE_DISPATCH_TABLE_INFO(HipDispatchTable, hip)
+HIP_DEFINE_DISPATCH_TABLE_INFO(HipCompilerDispatchTable, hip_compiler)
 #endif
 
 template <typename Tp> void ToolInit(Tp* table) {
@@ -1271,21 +1297,6 @@ template <typename Tp> Tp& GetDispatchTableImpl() {
   // using a static inside a function prevents static initialization fiascos
   static auto dispatch_table = Tp{};
 
-#if HIP_ROCPROFILER_REGISTER > 0
-  // cause a compiler error if the size of the API table changed (most likely due to addition of new
-  // dispatch table entry) to make sure the developer is reminded to update the table
-  // versioning value before changing the value in HIP_DEFINE_DISPATCH_TABLE_INFO to make this
-  // static assert pass. Please note: rocprofiler will do very strict compile time checks to make
-  // sure these versioning values are appropriately updated -- so commenting out this check, only
-  // updating the size field in HIP_DEFINE_DISPATCH_TABLE_INFO, etc. will result in the
-  // rocprofiler-sdk failing to build and your modifications will not be able to be staged.
-  static_assert(
-      sizeof(Tp) == dispatch_table_info<Tp>::size,
-      "size of the API table struct has changed. Update the STEP_VERSION number (or in rare cases, "
-      "the MAJOR_VERSION number) in <hipamd/include/hip/amd_detail/hip_api_trace.hpp> for the "
-      "failing API struct before changing the SIZE field passed to HIP_DEFINE_DISPATCH_TABLE_INFO");
-#endif
-
   // Change all the function pointers to point to the HIP runtime implementation functions
   UpdateDispatchTable(&dispatch_table);
 
@@ -1307,10 +1318,33 @@ const HipCompilerDispatchTable* GetHipCompilerDispatchTable() {
 }  // namespace hip
 
 #if !defined(_WIN32)
+constexpr auto ComputeTableOffset(size_t num_funcs) {
+  return (num_funcs * sizeof(void*)) + sizeof(size_t);
+}
+
+// HIP_ENFORCE_ABI_VERSIONING will cause a compiler error if the size of the API table changed (most
+// likely due to addition of new dispatch table entry) to make sure the developer is reminded to
+// update the table versioning value before changing the value in HIP_ENFORCE_ABI_VERSIONING to make
+// this static assert pass.
+//
+// HIP_ENFORCE_ABI will cause a compiler error if the order of the members in the API table change. Do not reorder member variables and change existing HIP_ENFORCE_ABI values -- always
+//
+// Please note: rocprofiler will do very strict compile time checks to make
+// sure these versioning values are appropriately updated -- so commenting out this check, only
+// updating the size field in HIP_ENFORCE_ABI_VERSIONING, etc. will result in the
+// rocprofiler-sdk failing to build and you will be forced to do the work anyway.
+#define HIP_ENFORCE_ABI_VERSIONING(TABLE, NUM)                                                     \
+  static_assert(                                                                                   \
+      sizeof(TABLE) == ComputeTableOffset(NUM),                                                    \
+      "size of the API table struct has changed. Update the STEP_VERSION number (or in rare "      \
+      "cases, the MAJOR_VERSION number) in <hipamd/include/hip/amd_detail/hip_api_trace.hpp> for " \
+      "the failing API struct before changing the SIZE field passed to "                           \
+      "HIP_DEFINE_DISPATCH_TABLE_INFO");
+
 #define HIP_ENFORCE_ABI(TABLE, ENTRY, NUM)                                                         \
-  static_assert(offsetof(TABLE, ENTRY) == (sizeof(size_t) + (NUM * sizeof(void*))),                \
+  static_assert(offsetof(TABLE, ENTRY) == ComputeTableOffset(NUM),                                 \
                 "ABI break for " #TABLE "." #ENTRY                                                 \
-                ". Only add new function pointers to end of struct and do not rearrange them");
+                ". Only add new function pointers to end of struct and do not rearrange them " );
 
 // These ensure that function pointers are not re-ordered
 HIP_ENFORCE_ABI(HipCompilerDispatchTable, __hipPopCallConfiguration_fn, 0)
@@ -1322,6 +1356,14 @@ HIP_ENFORCE_ABI(HipCompilerDispatchTable, __hipRegisterSurface_fn, 5)
 HIP_ENFORCE_ABI(HipCompilerDispatchTable, __hipRegisterTexture_fn, 6)
 HIP_ENFORCE_ABI(HipCompilerDispatchTable, __hipRegisterVar_fn, 7)
 HIP_ENFORCE_ABI(HipCompilerDispatchTable, __hipUnregisterFatBinary_fn, 8)
+
+// if HIP_ENFORCE_ABI entries are added for each new function pointer in the table, the number below
+// will be +1 of the number in the last HIP_ENFORCE_ABI line. E.g.:
+//
+//  HIP_ENFORCE_ABI(<table>, <functor>, 8)
+//
+//  HIP_ENFORCE_ABI_VERSIONING(<table>, 9) <- 8 + 1 = 9
+HIP_ENFORCE_ABI_VERSIONING(HipCompilerDispatchTable, 9)
 
 static_assert(HIP_COMPILER_API_TABLE_MAJOR_VERSION == 0 && HIP_COMPILER_API_TABLE_STEP_VERSION == 0,
               "If you get this error, add new HIP_ENFORCE_ABI(...) code for the new function "
@@ -1758,8 +1800,35 @@ HIP_ENFORCE_ABI(HipDispatchTable, hipStreamGetCaptureInfo_v2_spt_fn, 425)
 HIP_ENFORCE_ABI(HipDispatchTable, hipLaunchHostFunc_spt_fn, 426)
 HIP_ENFORCE_ABI(HipDispatchTable, hipGetStreamDeviceId_fn, 427)
 HIP_ENFORCE_ABI(HipDispatchTable, hipDrvGraphAddMemsetNode_fn, 428)
+HIP_ENFORCE_ABI(HipDispatchTable, hipGraphAddExternalSemaphoresWaitNode_fn, 429);
+HIP_ENFORCE_ABI(HipDispatchTable, hipGraphAddExternalSemaphoresSignalNode_fn, 430);
+HIP_ENFORCE_ABI(HipDispatchTable, hipGraphExternalSemaphoresSignalNodeSetParams_fn, 431);
+HIP_ENFORCE_ABI(HipDispatchTable, hipGraphExternalSemaphoresWaitNodeSetParams_fn, 432);
+HIP_ENFORCE_ABI(HipDispatchTable, hipGraphExternalSemaphoresSignalNodeGetParams_fn, 433);
+HIP_ENFORCE_ABI(HipDispatchTable, hipGraphExternalSemaphoresWaitNodeGetParams_fn, 434);
+HIP_ENFORCE_ABI(HipDispatchTable, hipGraphExecExternalSemaphoresSignalNodeSetParams_fn, 435);
+HIP_ENFORCE_ABI(HipDispatchTable, hipGraphExecExternalSemaphoresWaitNodeSetParams_fn, 436);
+HIP_ENFORCE_ABI(HipDispatchTable, hipGraphAddNode_fn, 437);
+HIP_ENFORCE_ABI(HipDispatchTable, hipGraphInstantiateWithParams_fn, 438);
+HIP_ENFORCE_ABI(HipDispatchTable, hipExtGetLastError_fn, 439)
+HIP_ENFORCE_ABI(HipDispatchTable, hipTexRefGetBorderColor_fn, 440)
+HIP_ENFORCE_ABI(HipDispatchTable, hipTexRefGetArray_fn, 441)
+HIP_ENFORCE_ABI(HipDispatchTable, hipGetProcAddress_fn, 442)
+HIP_ENFORCE_ABI(HipDispatchTable, hipStreamBeginCaptureToGraph_fn, 443);
+HIP_ENFORCE_ABI(HipDispatchTable, hipGetFuncBySymbol_fn, 444);
+HIP_ENFORCE_ABI(HipDispatchTable, hipDrvGraphAddMemFreeNode_fn, 445)
+HIP_ENFORCE_ABI(HipDispatchTable, hipDrvGraphExecMemcpyNodeSetParams_fn, 446)
+HIP_ENFORCE_ABI(HipDispatchTable, hipDrvGraphExecMemsetNodeSetParams_fn, 447)
 
-static_assert(HIP_RUNTIME_API_TABLE_MAJOR_VERSION == 0 && HIP_RUNTIME_API_TABLE_STEP_VERSION == 0,
+// if HIP_ENFORCE_ABI entries are added for each new function pointer in the table, the number below
+// will be +1 of the number in the last HIP_ENFORCE_ABI line. E.g.:
+//
+//  HIP_ENFORCE_ABI(<table>, <functor>, 8)
+//
+//  HIP_ENFORCE_ABI_VERSIONING(<table>, 9) <- 8 + 1 = 9
+HIP_ENFORCE_ABI_VERSIONING(HipDispatchTable, 448)
+
+static_assert(HIP_RUNTIME_API_TABLE_MAJOR_VERSION == 0 && HIP_RUNTIME_API_TABLE_STEP_VERSION == 3,
               "If you get this error, add new HIP_ENFORCE_ABI(...) code for the new function "
               "pointers and then update this check so it is true");
 #endif

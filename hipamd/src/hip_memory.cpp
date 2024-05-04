@@ -76,7 +76,7 @@ hipError_t ihipFree(void *ptr) {
   if (memory_object != nullptr) {
     // Wait on the device, associated with the current memory object during allocation
     auto device_id = memory_object->getUserData().deviceId;
-    hip::Stream::SyncAllStreams(device_id);
+    g_devices[device_id]->SyncAllStreams();
 
     // Find out if memory belongs to any memory pool
     if (!g_devices[device_id]->FreeMemory(memory_object, nullptr)) {
@@ -367,11 +367,25 @@ hipError_t ihipMemcpy_validate(void* dst, const void* src, size_t sizeBytes,
   amd::Memory* srcMemory = getMemoryObject(src, sOffset);
   size_t dOffset = 0;
   amd::Memory* dstMemory = getMemoryObject(dst, dOffset);
+
+  // If the mem object is a VMM sub buffer (subbuffer has parent set),
+  // then use parent's size for validation.
+  if (srcMemory && srcMemory->parent() && (srcMemory->getMemFlags() & CL_MEM_VA_RANGE_AMD)) {
+      srcMemory = srcMemory->parent();
+  }
+
+  // If the mem object is a VMM sub buffer (subbuffer has parent set),
+  // then use parent's size for validation.
+  if (dstMemory && dstMemory->parent() && (dstMemory->getMemFlags() & CL_MEM_VA_RANGE_AMD)) {
+      dstMemory = dstMemory->parent();
+  }
+
   // Return error if sizeBytes passed to memcpy is more than the actual size allocated
   if ((dstMemory && sizeBytes > (dstMemory->getSize() - dOffset)) ||
       (srcMemory && sizeBytes > (srcMemory->getSize() - sOffset))) {
     return hipErrorInvalidValue;
   }
+
   //If src and dst ptr are null then kind must be either h2h or def.
   if (!IsHtoHMemcpyValid(dst, src, kind)) {
     return hipErrorInvalidValue;
@@ -391,8 +405,8 @@ hipError_t ihipMemcpyCommand(amd::Command*& command, void* dst, const void* src,
   amd::CopyMetadata copyMetadata(isAsync, amd::CopyMetadata::CopyEnginePreference::NONE);
   if ((srcMemory == nullptr) && (dstMemory != nullptr)) {
     hip::Stream* pStream = &stream;
-    if (queueDevice != dstMemory->getContext().devices()[0]) {
-      pStream = hip::getNullStream(dstMemory->getContext());
+    if (queueDevice != dstMemory->GetDeviceById()) {
+      pStream = hip::getNullStream(dstMemory->GetDeviceById()->context());
       amd::Command* cmd = stream.getLastQueuedCommand(true);
       if (cmd != nullptr) {
         waitList.push_back(cmd);
@@ -402,8 +416,8 @@ hipError_t ihipMemcpyCommand(amd::Command*& command, void* dst, const void* src,
               *dstMemory->asBuffer(), dOffset, sizeBytes, src, 0, 0, copyMetadata);
   } else if ((srcMemory != nullptr) && (dstMemory == nullptr)) {
     hip::Stream* pStream = &stream;
-    if (queueDevice != srcMemory->getContext().devices()[0]) {
-      pStream = hip::getNullStream(srcMemory->getContext());
+    if (queueDevice != srcMemory->GetDeviceById()) {
+      pStream = hip::getNullStream(srcMemory->GetDeviceById()->context());
       amd::Command* cmd = stream.getLastQueuedCommand(true);
       if (cmd != nullptr) {
         waitList.push_back(cmd);
@@ -415,7 +429,7 @@ hipError_t ihipMemcpyCommand(amd::Command*& command, void* dst, const void* src,
     // Check if the queue device doesn't match the device on any memory object.
     // And any of them are not host allocation.
     // Hence it's a P2P transfer, because the app has requested access to another GPU
-    if ((srcMemory->getContext().devices()[0] != dstMemory->getContext().devices()[0]) &&
+    if ((srcMemory->GetDeviceById() != dstMemory->GetDeviceById()) &&
         ((srcMemory->getContext().devices().size() == 1) &&
          (dstMemory->getContext().devices().size() == 1))) {
       command = new amd::CopyMemoryP2PCommand(stream, CL_COMMAND_COPY_BUFFER, waitList,
@@ -431,26 +445,26 @@ hipError_t ihipMemcpyCommand(amd::Command*& command, void* dst, const void* src,
       }
     } else {
       hip::Stream* pStream = &stream;
-      if ((srcMemory->getContext().devices()[0] == dstMemory->getContext().devices()[0]) &&
+      if ((srcMemory->GetDeviceById() == dstMemory->GetDeviceById()) &&
           (queueDevice != srcMemory->getContext().devices()[0])) {
-        pStream = hip::getNullStream(srcMemory->getContext());
+        pStream = hip::getNullStream(srcMemory->GetDeviceById()->context());
         amd::Command* cmd = stream.getLastQueuedCommand(true);
         if (cmd != nullptr) {
           waitList.push_back(cmd);
         }
-      } else if (srcMemory->getContext().devices()[0] != dstMemory->getContext().devices()[0]) {
+      } else if (srcMemory->GetDeviceById() != dstMemory->GetDeviceById()) {
         // Scenarios such as DtoH where dst is pinned memory
         if ((queueDevice != srcMemory->getContext().devices()[0]) &&
             (dstMemory->getContext().devices().size() != 1)) {
-          pStream = hip::getNullStream(srcMemory->getContext());
+          pStream = hip::getNullStream(srcMemory->GetDeviceById()->context());
           amd::Command* cmd = stream.getLastQueuedCommand(true);
           if (cmd != nullptr) {
             waitList.push_back(cmd);
           }
         // Scenarios such as HtoD where src is pinned memory
-        } else if ((queueDevice != dstMemory->getContext().devices()[0]) &&
+        } else if ((queueDevice != dstMemory->GetDeviceById()) &&
                    (srcMemory->getContext().devices().size() != 1)) {
-          pStream = hip::getNullStream(dstMemory->getContext());
+          pStream = hip::getNullStream(dstMemory->GetDeviceById()->context());
           amd::Command* cmd = stream.getLastQueuedCommand(true);
           if (cmd != nullptr) {
             waitList.push_back(cmd);
@@ -516,7 +530,7 @@ hipError_t ihipMemcpy(void* dst, const void* src, size_t sizeBytes, hipMemcpyKin
   } else if (((srcMemory == nullptr) && (dstMemory != nullptr)) ||
              ((srcMemory != nullptr) && (dstMemory == nullptr))) {
     isHostAsync = false;
-  } else if (srcMemory->getContext().devices()[0] == dstMemory->getContext().devices()[0]) {
+  } else if (srcMemory->GetDeviceById() == dstMemory->GetDeviceById()) {
     hipMemoryType srcMemoryType = ((CL_MEM_SVM_FINE_GRAIN_BUFFER | CL_MEM_USE_HOST_PTR) &
         srcMemory->getMemFlags())? hipMemoryTypeHost : hipMemoryTypeDevice;
     hipMemoryType dstMemoryType = ((CL_MEM_SVM_FINE_GRAIN_BUFFER | CL_MEM_USE_HOST_PTR) &
@@ -536,7 +550,7 @@ hipError_t ihipMemcpy(void* dst, const void* src, size_t sizeBytes, hipMemcpyKin
   if (!isHostAsync) {
     command->awaitCompletion();
   } else if (!isGPUAsync) {
-    hip::Stream* pStream = hip::getNullStream(dstMemory->getContext());
+    hip::Stream* pStream = hip::getNullStream(dstMemory->GetDeviceById()->context());
     amd::Command::EventWaitList waitList;
     waitList.push_back(command);
     amd::Command* depdentMarker = new amd::Marker(*pStream, false, waitList);
@@ -575,6 +589,8 @@ hipError_t hipExtMallocWithFlags(void** ptr, size_t sizeBytes, unsigned int flag
     ihipFlags = CL_MEM_SVM_ATOMICS;
   } else if (flags == hipDeviceMallocUncached) {
     ihipFlags = CL_MEM_SVM_ATOMICS | ROCCLR_MEM_HSA_UNCACHED;
+  } else if (flags == hipDeviceMallocContiguous) {
+    ihipFlags = ROCCLR_MEM_HSA_CONTIGUOUS | ROCCLR_MEM_HSA_UNCACHED;
   } else if (flags == hipMallocSignalMemory) {
     ihipFlags = CL_MEM_SVM_ATOMICS | CL_MEM_SVM_FINE_GRAIN_BUFFER | ROCCLR_MEM_HSA_SIGNAL_MEMORY;
     if (sizeBytes != 8) {
@@ -743,7 +759,7 @@ hipError_t ihipArrayDestroy(hipArray_t array) {
 
   auto image = as_amd(memObj);
   // Wait on the device, associated with the current memory object during allocation
-  hip::Stream::SyncAllStreams(image->getUserData().deviceId);
+  g_devices[image->getUserData().deviceId]->SyncAllStreams();
   image->release();
 
   delete array;
@@ -812,11 +828,6 @@ hipError_t ihipMallocPitch(void** ptr, size_t* pitch, size_t width, size_t heigh
   if ((width == 0) || (height == 0) || (depth == 0)) {
     *ptr = nullptr;
     return hipSuccess;
-  }
-
-  if (device && !device->info().imageSupport_) {
-    LogPrintfError("Image is not supported on device %p", device);
-    return hipErrorInvalidValue;
   }
 
   //avoid size_t overflow for pitch calculation
@@ -1257,7 +1268,7 @@ hipError_t ihipHostUnregister(void* hostPtr) {
 
   if (mem != nullptr) {
     // Wait on the device, associated with the current memory object during allocation
-    hip::Stream::SyncAllStreams(mem->getUserData().deviceId);
+    g_devices[mem->getUserData().deviceId]->SyncAllStreams();
 
     amd::MemObjMap::RemoveMemObj(hostPtr);
     for (const auto& device: g_devices) {
@@ -2268,7 +2279,7 @@ void ihipCopyMemParamSet(const HIP_MEMCPY3D* pCopy, hipMemoryType& srcMemType,
                     hipMemoryTypeHost;
 
     if (dstMemoryType == hipMemoryTypeDevice) {
-      const_cast<HIP_MEMCPY3D*>(pCopy)->dstDevice = const_cast<void*>(pCopy->dstDevice);
+      const_cast<HIP_MEMCPY3D*>(pCopy)->dstDevice = const_cast<void*>(pCopy->dstHost);
     }
   }
   srcMemType = srcMemoryType;
@@ -2883,53 +2894,6 @@ hipError_t ihipMemcpy3D_validate(const hipMemcpy3DParms* p) {
   //If src and dst ptr are null then kind must be either h2h or def.
   if (!IsHtoHMemcpyValid(p->dstPtr.ptr, p->srcPtr.ptr, p->kind)) {
     return hipErrorInvalidValue;
-  }
-  return hipSuccess;
-}
-
-hipError_t ihipDrvMemcpy3DParamValidate(const HIP_MEMCPY3D* p) {
-  // Passing more than one non-zero source or destination will cause hipMemcpy3D() to
-  // return an error.
-  if (p == nullptr || ((p->srcArray != nullptr) && (p->srcHost != nullptr)) ||
-      ((p->dstArray != nullptr) && (p->dstHost != nullptr))) {
-    return hipErrorInvalidValue;
-  }
-  // The struct passed to hipMemcpy3D() must specify one of srcArray or srcPtr and one of dstArray
-  // or dstPtr.
-  if (((p->srcArray == nullptr) && (p->srcHost == nullptr)) ||
-      ((p->dstArray == nullptr) && (p->dstHost == nullptr))) {
-    return hipErrorInvalidValue;
-  }
-
-  // If the source and destination are both arrays, hipMemcpy3D() will return an error if they do
-  // not have the same element size.
-  if (((p->srcArray != nullptr) && (p->dstArray != nullptr)) &&
-      (hip::getElementSize(p->srcArray) != hip::getElementSize(p->dstArray))) {
-    return hipErrorInvalidValue;
-  }
-
-  // dst/src pitch must be less than max pitch
-  auto* deviceHandle = g_devices[hip::getCurrentDevice()->deviceId()]->devices()[0];
-  const auto& info = deviceHandle->info();
-  constexpr auto int32_max = static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
-  auto maxPitch = std::min(info.maxMemAllocSize_, int32_max);
-
-  // negative pitch cases
-  if (p->srcPitch >= maxPitch || p->dstPitch >= maxPitch) {
-    return hipErrorInvalidValue;
-  }
-
-  if (p->dstArray == nullptr && p->srcArray == nullptr) {
-    if ((p->WidthInBytes + p->srcXInBytes > p->srcPitch) ||
-        (p->WidthInBytes + p->dstXInBytes > p->dstPitch)) {
-      return hipErrorInvalidValue;
-    }
-  }
-  if (p->srcMemoryType < hipMemoryTypeHost || p->srcMemoryType > hipMemoryTypeManaged) {
-    return hipErrorInvalidMemcpyDirection;
-  }
-  if (p->dstMemoryType < hipMemoryTypeHost || p->dstMemoryType > hipMemoryTypeManaged) {
-    return hipErrorInvalidMemcpyDirection;
   }
   return hipSuccess;
 }
@@ -3725,6 +3689,12 @@ hipError_t ihipPointerGetAttributes(void* data, hipPointer_attribute attribute,
           ((CL_MEM_SVM_FINE_GRAIN_BUFFER | CL_MEM_USE_HOST_PTR) &
             memObj->getMemFlags())? hipMemoryTypeHost : hipMemoryTypeDevice;
         } else { // checks for array type
+          // ptr must be a host allocation using malloc since memObj is null and is
+          // not found in hipArraySet.
+          if (hip::hipArraySet.find(static_cast<hipArray*>(ptr)) == hip::hipArraySet.end()) {
+            *reinterpret_cast<uint32_t*>(data) = 0;
+            return hipErrorInvalidValue;
+          }
           cl_mem dstMemObj = reinterpret_cast<cl_mem>((static_cast<hipArray*>(ptr))->data);
           if (!is_valid(dstMemObj)) {
             *reinterpret_cast<uint32_t*>(data) = 0;
@@ -3785,8 +3755,12 @@ hipError_t ihipPointerGetAttributes(void* data, hipPointer_attribute attribute,
         break;
       }
       case HIP_POINTER_ATTRIBUTE_SYNC_MEMOPS : {
-        // This attribute is ideally used in hipPointerSetAttribute, defaults to true
-        *reinterpret_cast<bool*>(data) = true;
+        if (memObj) {
+          *reinterpret_cast<bool*>(data) = memObj->getUserData().sync_mem_ops_;
+        } else {
+          *reinterpret_cast<bool*>(data) = false;
+          return hipErrorInvalidValue;
+        }
         break;
       }
       case HIP_POINTER_ATTRIBUTE_BUFFER_ID : {
@@ -4303,7 +4277,7 @@ hipError_t ihipMipmappedArrayDestroy(hipMipmappedArray_t mipmapped_array_ptr) {
 
   auto image = as_amd(mem_obj);
   // Wait on the device, associated with the current memory object during allocation
-  hip::Stream::SyncAllStreams(image->getUserData().deviceId);
+  g_devices[image->getUserData().deviceId]->SyncAllStreams();
   image->release();
 
   delete mipmapped_array_ptr;

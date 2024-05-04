@@ -247,6 +247,26 @@ static bool getProcName(uint32_t EFlags, std::string& proc_name, bool& xnackSupp
       sramEccSupported = false;
       proc_name = "gfx1103";
       break;
+    case EF_AMDGPU_MACH_AMDGCN_GFX1150:
+      xnackSupported = false;
+      sramEccSupported = false;
+      proc_name = "gfx1150";
+      break;
+    case EF_AMDGPU_MACH_AMDGCN_GFX1151:
+      xnackSupported = false;
+      sramEccSupported = false;
+      proc_name = "gfx1151";
+      break;
+    case EF_AMDGPU_MACH_AMDGCN_GFX1200:
+      xnackSupported = false;
+      sramEccSupported = false;
+      proc_name = "gfx1200";
+      break;
+    case EF_AMDGPU_MACH_AMDGCN_GFX1201:
+      xnackSupported = false;
+      sramEccSupported = false;
+      proc_name = "gfx1201";
+      break;
     default:
       return false;
   }
@@ -418,39 +438,6 @@ bool isCodeObjectCompatibleWithDevice(std::string co_triple_target_id,
     if (co_xnack != isa_xnack) return false;
   }
 
-  return true;
-}
-
-bool UnbundleBitCode(const std::vector<char>& bundled_llvm_bitcode, const std::string& isa,
-                     size_t& co_offset, size_t& co_size) {
-  std::string magic(bundled_llvm_bitcode.begin(),
-                    bundled_llvm_bitcode.begin() + bundle_magic_string_size);
-  if (magic.compare(CLANG_OFFLOAD_BUNDLER_MAGIC_STR)) {
-    // Handle case where the whole file is unbundled
-    return true;
-  }
-
-  std::string bundled_llvm_bitcode_s(bundled_llvm_bitcode.begin(),
-                                     bundled_llvm_bitcode.begin() + bundled_llvm_bitcode.size());
-  const void* data = reinterpret_cast<const void*>(bundled_llvm_bitcode_s.c_str());
-  const auto obheader = reinterpret_cast<const __ClangOffloadBundleHeader*>(data);
-  const auto* desc = &obheader->desc[0];
-  for (uint64_t idx = 0; idx < obheader->numOfCodeObjects; ++idx,
-                desc = reinterpret_cast<const __ClangOffloadBundleInfo*>(
-                    reinterpret_cast<uintptr_t>(&desc->bundleEntryId[0]) +
-                    desc->bundleEntryIdSize)) {
-    const void* image =
-        reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(obheader) + desc->offset);
-    const size_t image_size = desc->size;
-    std::string bundleEntryId{desc->bundleEntryId, desc->bundleEntryIdSize};
-
-    // Check if the device id and code object id are compatible
-    if (isCodeObjectCompatibleWithDevice(bundleEntryId, isa)) {
-      co_offset = (reinterpret_cast<uintptr_t>(image) - reinterpret_cast<uintptr_t>(data));
-      co_size = image_size;
-      break;
-    }
-  }
   return true;
 }
 

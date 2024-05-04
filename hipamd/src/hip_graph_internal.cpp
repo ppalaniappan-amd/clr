@@ -66,38 +66,21 @@ hipError_t GraphMemcpyNode1D::ValidateParams(void* dst, const void* src, size_t 
   if (status != hipSuccess) {
     return status;
   }
-  size_t sOffsetOrig = 0;
-  amd::Memory* origSrcMemory = getMemoryObject(src, sOffsetOrig);
-  size_t dOffsetOrig = 0;
-  amd::Memory* origDstMemory = getMemoryObject(dst, dOffsetOrig);
-
   size_t sOffset = 0;
   amd::Memory* srcMemory = getMemoryObject(src, sOffset);
   size_t dOffset = 0;
   amd::Memory* dstMemory = getMemoryObject(dst, dOffset);
 
   if ((srcMemory == nullptr) && (dstMemory != nullptr)) {  // host to device
-    if (origDstMemory->getContext().devices()[0] != dstMemory->getContext().devices()[0]) {
-      return hipErrorInvalidValue;
-    }
     if ((kind != hipMemcpyHostToDevice) && (kind != hipMemcpyDefault)) {
       return hipErrorInvalidValue;
     }
   } else if ((srcMemory != nullptr) && (dstMemory == nullptr)) {  // device to host
-    if (origSrcMemory->getContext().devices()[0] != srcMemory->getContext().devices()[0]) {
-      return hipErrorInvalidValue;
-    }
     if ((kind != hipMemcpyDeviceToHost) && (kind != hipMemcpyDefault)) {
       return hipErrorInvalidValue;
     }
-  } else if ((srcMemory != nullptr) && (dstMemory != nullptr)) {
-    if (origDstMemory->getContext().devices()[0] != dstMemory->getContext().devices()[0]) {
-      return hipErrorInvalidValue;
-    }
-    if (origSrcMemory->getContext().devices()[0] != srcMemory->getContext().devices()[0]) {
-      return hipErrorInvalidValue;
-    }
   }
+
   return hipSuccess;
 }
 
@@ -302,6 +285,10 @@ Graph* Graph::clone(std::unordered_map<Node, Node>& clonedNodes) const {
     }
     clonedNodes[node]->SetDependencies(clonedDependencies);
   }
+  for (auto userObj : graphUserObj_) {
+    userObj->retain();
+    newGraph->graphUserObj_.insert(userObj);
+  }
   return newGraph;
 }
 
@@ -344,11 +331,19 @@ hipError_t GraphExec::Init() {
 
   for (auto& node : topoOrder_) {
     status = node->GetNumParallelStreams(min_num_streams);
-    if(status != hipSuccess) {
+    if (status != hipSuccess) {
       return status;
     }
   }
   status = CreateStreams(parallelLists_.size() - 1 + min_num_streams);
+  if (status != hipSuccess) {
+    return status;
+  }
+  if (DEBUG_CLR_GRAPH_PACKET_CAPTURE) {
+    // For graph nodes capture AQL packets to dispatch them directly during graph launch.
+    status = CaptureAQLPackets();
+  }
+  instantiateDeviceId_ = hip::getCurrentDevice()->deviceId();
   return status;
 }
 
@@ -360,63 +355,60 @@ hipError_t GraphExec::CaptureAQLPackets() {
     // arg size required for all graph kernel nodes to allocate
     for (const auto& list : parallelLists_) {
       for (auto& node : list) {
-        if (node->GetType() == hipGraphNodeTypeKernel) {
+        if (node->GetType() == hipGraphNodeTypeKernel &&
+            !reinterpret_cast<hip::GraphKernelNode*>(node)->HasHiddenHeap()) {
           kernArgSizeForGraph += reinterpret_cast<hip::GraphKernelNode*>(node)->GetKerArgSize();
         }
       }
     }
-
     auto device = g_devices[ihipGetDevice()]->devices()[0];
-    if (device->info().largeBar_) {
-      // Pad kernel argument buffer with sentinal size bytes to do a readback later
-      kernArgSizeForGraph += sizeof(int);
-      kernarg_pool_graph_ =
-          reinterpret_cast<address>(device->deviceLocalAlloc(kernArgSizeForGraph));
-      device_kernarg_pool_ = true;
-    } else {
-      kernarg_pool_graph_ = reinterpret_cast<address>(
-          device->hostAlloc(kernArgSizeForGraph, 0, amd::Device::MemorySegment::kKernArg));
-    }
+    if (kernArgSizeForGraph != 0) {
+      if (device->info().largeBar_) {
+        kernarg_pool_graph_ =
+            reinterpret_cast<address>(device->deviceLocalAlloc(kernArgSizeForGraph));
+        device_kernarg_pool_ = true;
+      } else {
+        kernarg_pool_graph_ = reinterpret_cast<address>(
+            device->hostAlloc(kernArgSizeForGraph, 0, amd::Device::MemorySegment::kKernArg));
+      }
 
-    if (kernarg_pool_graph_ == nullptr) {
-      return hipErrorMemoryAllocation;
+      if (kernarg_pool_graph_ == nullptr) {
+        return hipErrorMemoryAllocation;
+      }
+      kernarg_pool_size_graph_ = kernArgSizeForGraph;
     }
-    kernarg_pool_size_graph_ = kernArgSizeForGraph;
-
     for (auto& node : topoOrder_) {
-      if (node->GetType() == hipGraphNodeTypeKernel) {
+      if (node->GetType() == hipGraphNodeTypeKernel &&
+          !reinterpret_cast<hip::GraphKernelNode*>(node)->HasHiddenHeap()) {
         auto kernelNode = reinterpret_cast<hip::GraphKernelNode*>(node);
         // From the kernel pool allocate the kern arg size required for the current kernel node.
-        address kernArgOffset = allocKernArg(kernelNode->GetKernargSegmentByteSize(),
-                                             kernelNode->GetKernargSegmentAlignment());
-        if (kernArgOffset == nullptr) {
-          return hipErrorMemoryAllocation;
+        address kernArgOffset = nullptr;
+        if (kernelNode->GetKernargSegmentByteSize()) {
+          kernArgOffset = allocKernArg(kernelNode->GetKernargSegmentByteSize(),
+                                       kernelNode->GetKernargSegmentAlignment());
+          if (kernArgOffset == nullptr) {
+            return hipErrorMemoryAllocation;
+          }
         }
         // Form GPU packet capture for the kernel node.
-        kernelNode->CaptureAndFormPacket(capture_stream_, kernArgOffset) ;
+        kernelNode->CaptureAndFormPacket(capture_stream_, kernArgOffset);
       }
     }
 
     if (device_kernarg_pool_) {
-      // Write HDP_MEM_COHERENCY_FLUSH_CNTL reg to initiate flush read to HDP mem. Verify mem
-      // by readback of sentinal value at the tail end of the kernarg surface (allocated above)
-      // This needs to be done for PCIE connected devices only. HDP path is disabled for XGMI
-      // between CPU<->GPU
-      if (!device->isXgmi()) {
-        static int host_val = 1;
-        address dev_ptr = kernarg_pool_graph_ + kernarg_pool_size_graph_ - sizeof(int);
-        *dev_ptr = host_val;
-        if (device->info().hdpMemFlushCntl == nullptr) {
-          amd::Command* command = new amd::Marker(*capture_stream_, true);
-          if (command != nullptr) {
-            command->enqueue();
-            command->release();
-          }
-        } else {
-          *device->info().hdpMemFlushCntl = 1;
-        }
-        while (*dev_ptr != host_val);
-        host_val++;
+      auto kernArgImpl = device->settings().kernel_arg_impl_;
+
+      if (kernArgImpl == KernelArgImpl::DeviceKernelArgsHDP) {
+        *device->info().hdpMemFlushCntl = 1u;
+        volatile auto kSentinel = *device->info().hdpMemFlushCntl;
+      } else if (kernArgImpl == KernelArgImpl::DeviceKernelArgsReadback &&
+                 kernarg_pool_size_graph_ != 0) {
+        address dev_ptr = kernarg_pool_graph_ + kernarg_pool_size_graph_;
+        volatile auto kSentinel = *(dev_ptr - 1);
+        _mm_sfence();
+        *(dev_ptr - 1) = kSentinel;
+        _mm_mfence();
+        kSentinel = *(dev_ptr - 1);
       }
     }
 
@@ -581,18 +573,23 @@ hipError_t GraphExec::Run(hipStream_t stream) {
     repeatLaunch_ = true;
   }
 
-  if (parallelLists_.size() == 1) {
+  if (parallelLists_.size() == 1 &&
+      instantiateDeviceId_ == hip_stream->DeviceId()) {
     amd::AccumulateCommand* accumulate = nullptr;
-    bool isLastPacketKernel = false;
+    bool isLastKernelWithoutHiddenHeap =
+        ((topoOrder_.back()->GetType() == hipGraphNodeTypeKernel) &&
+         !reinterpret_cast<hip::GraphKernelNode*>(topoOrder_.back())->HasHiddenHeap());
     if (DEBUG_CLR_GRAPH_PACKET_CAPTURE) {
-      uint8_t* lastCapturedPacket = (topoOrder_.back()->GetType() == hipGraphNodeTypeKernel)
-          ? topoOrder_.back()->GetAqlPacket()
-          : nullptr;
-      accumulate = new amd::AccumulateCommand(*hip_stream, {}, nullptr, lastCapturedPacket);
+      uint8_t* lastCapturedPacket =
+          isLastKernelWithoutHiddenHeap ? topoOrder_.back()->GetAqlPacket() : nullptr;
+      if (topoOrder_.back()->GetEnabled()) {
+        accumulate = new amd::AccumulateCommand(*hip_stream, {}, nullptr, lastCapturedPacket);
+      }
     }
 
     for (int i = 0; i < topoOrder_.size() - 1; i++) {
-      if (DEBUG_CLR_GRAPH_PACKET_CAPTURE && topoOrder_[i]->GetType() == hipGraphNodeTypeKernel) {
+      if (DEBUG_CLR_GRAPH_PACKET_CAPTURE && topoOrder_[i]->GetType() == hipGraphNodeTypeKernel &&
+          !reinterpret_cast<hip::GraphKernelNode*>(topoOrder_[i])->HasHiddenHeap()) {
         if (topoOrder_[i]->GetEnabled()) {
           hip_stream->vdev()->dispatchAqlPacket(topoOrder_[i]->GetAqlPacket(), accumulate);
           accumulate->addKernelName(topoOrder_[i]->GetKernelName());
@@ -606,22 +603,27 @@ hipError_t GraphExec::Run(hipStream_t stream) {
 
     // If last captured packet is kernel, optimize to detect completion of last kernel
     // This saves on extra packet submitted to determine end of graph
-    if (DEBUG_CLR_GRAPH_PACKET_CAPTURE && topoOrder_.back()->GetType() == hipGraphNodeTypeKernel) {
+    if (DEBUG_CLR_GRAPH_PACKET_CAPTURE && isLastKernelWithoutHiddenHeap) {
       // Add the last kernel node name to the accumulate command
-      accumulate->addKernelName(topoOrder_.back()->GetKernelName());
-      accumulate->enqueue();
-      accumulate->release();
-      isLastPacketKernel = true;
+      if (topoOrder_.back()->GetEnabled()) {
+        accumulate->addKernelName(topoOrder_.back()->GetKernelName());
+      }
     } else {
       topoOrder_.back()->SetStream(hip_stream, this);
       status = topoOrder_.back()->CreateCommand(topoOrder_.back()->GetQueue());
       topoOrder_.back()->EnqueueCommands(stream);
     }
 
-    // If last packet is not kernel, submit a marker to detect end of graph
-    if (DEBUG_CLR_GRAPH_PACKET_CAPTURE && !isLastPacketKernel) {
+    if (DEBUG_CLR_GRAPH_PACKET_CAPTURE) {
       accumulate->enqueue();
       accumulate->release();
+    }
+  } else if (parallelLists_.size() == 1 &&
+             instantiateDeviceId_ != hip_stream->DeviceId()) {
+    for (int i = 0; i < topoOrder_.size(); i++) {
+      topoOrder_[i]->SetStream(hip_stream, this);
+      status = topoOrder_[i]->CreateCommand(topoOrder_[i]->GetQueue());
+      topoOrder_[i]->EnqueueCommands(stream);
     }
   } else {
     UpdateStream(parallelLists_, hip_stream, this);
@@ -637,7 +639,7 @@ hipError_t GraphExec::Run(hipStream_t stream) {
       rootCommand->release();
     }
     for (int i = 0; i < topoOrder_.size(); i++) {
-      topoOrder_[i]->EnqueueCommands(stream);
+      topoOrder_[i]->EnqueueCommands(reinterpret_cast<hipStream_t>(topoOrder_[i]->GetQueue()));
     }
     if (endCommand != nullptr) {
       endCommand->enqueue();

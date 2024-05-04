@@ -221,6 +221,7 @@ class NullDevice : public amd::Device {
     ShouldNotReachHere();
     return;
   }
+
   void* virtualAlloc(void* req_addr, size_t size, size_t alignment) override {
     ShouldNotReachHere();
     return nullptr;
@@ -231,7 +232,7 @@ class NullDevice : public amd::Device {
     return;
   }
 
-  virtual bool SetMemAccess(void* va_addr, size_t va_size, VmmAccess access_flags, size_t count)
+  virtual bool SetMemAccess(void* va_addr, size_t va_size, VmmAccess access_flags)
                             override {
     ShouldNotReachHere();
     return false;
@@ -450,8 +451,10 @@ class Device : public NullDevice {
   bool deviceAllowAccess(void* dst) const;
 
   bool allowPeerAccess(device::Memory* memory) const;
+  void deviceVmemRelease(uint64_t mem_handle) const;
   uint64_t deviceVmemAlloc(size_t size, uint64_t flags) const;
-  void* deviceLocalAlloc(size_t size, bool atomics = false, bool pseudo_fine_grain=false) const;
+  void* deviceLocalAlloc(size_t size, bool atomics = false, bool pseudo_fine_grain=false,
+                         bool contiguous = false) const;
 
   void memFree(void* ptr, size_t size) const;
 
@@ -468,8 +471,12 @@ class Device : public NullDevice {
   virtual void* virtualAlloc(void* req_addr, size_t size, size_t alignment);
   virtual void virtualFree(void* addr);
 
-  virtual bool SetMemAccess(void* va_addr, size_t va_size, VmmAccess access_flags, size_t count);
+  virtual bool SetMemAccess(void* va_addr, size_t va_size, VmmAccess access_flags);
   virtual bool GetMemAccess(void* va_addr, VmmAccess* access_flags_ptr);
+
+  virtual bool ExportShareableVMMHandle(uint64_t hsa_handle, int flags, void* shareableHandle);
+
+  virtual bool ImportShareableVMMHandle(void* osHandle, uint64_t* hsa_handle_ptr) const;
 
   virtual bool SetClockMode(const cl_set_device_clock_mode_input_amd setClockModeInput,
                             cl_set_device_clock_mode_output_amd* pSetClockModeOutput);
@@ -582,7 +589,8 @@ class Device : public NullDevice {
   void HiddenHeapAlloc(const VirtualGPU& gpu);
 
   uint32_t fetchSDMAMask(const device::BlitManager* handle, bool readEngine = true) const;
-  void resetSDMAMask(const device::BlitManager* handle) const ;
+  void resetSDMAMask(const device::BlitManager* handle) const;
+  void getSdmaRWMasks(uint32_t* readMask, uint32_t* writeMask) const;
   bool isXgmi() const { return isXgmi_; }
 
  private:
@@ -611,7 +619,7 @@ class Device : public NullDevice {
   mutable std::mutex lock_allow_access_; //!< To serialize allow_access calls
   hsa_agent_t bkendDevice_;
   uint32_t pciDeviceId_;
-  hsa_agent_t* p2p_agents_list_;
+  hsa_agent_t* p2p_agents_list_ = nullptr;
   hsa_profile_t agent_profile_;
   hsa_amd_memory_pool_t group_segment_;
   hsa_amd_memory_pool_t system_segment_;

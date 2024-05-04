@@ -96,6 +96,10 @@ class PlatformState {
 
   hipError_t initStatManagedVarDevicePtr(int deviceId);
 
+  // Load hip dynamic library
+  void* getDynamicLibraryHandle();
+  void setDynamicLibraryHandle(void* handle);
+
   // Exec Functions
   void setupArgument(const void* arg, size_t size, size_t offset);
   void configureCall(dim3 gridDim, dim3 blockDim, size_t sharedMem, hipStream_t stream);
@@ -122,6 +126,6 @@ class PlatformState {
 
   std::unordered_map<std::string, std::shared_ptr<UniqueFD>> ufd_map_; //!< Unique File Desc Map
 
-  void* semaphore_{nullptr}; //!< Semaphore value for the binary kernel fusion project
+  void* dynamicLibraryHandle_{nullptr};
 };
 }  // namespace hip

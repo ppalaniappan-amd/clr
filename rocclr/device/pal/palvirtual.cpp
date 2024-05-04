@@ -408,7 +408,7 @@ bool VirtualGPU::Queue::flush() {
   submitInfo.ppFences             = &iCmdFences_[cmdBufIdSlot_];
 
   if (iQueue_->Type() == Pal::QueueTypeCompute) {
-    if (settings.useDeviceKernelArg_) {
+    if (gpu_.dev().settings().kernel_arg_impl_ == KernelArgImpl::DeviceKernelArgs) {
       // If runtime uses device memory for kernel arguments, then perform a CPU read back on
       // submission. That will make sure NBIO puches all previous CPU write requests through PCIE
       gpu_.managedBuffer().CpuReadBack();
@@ -955,10 +955,12 @@ bool VirtualGPU::create(bool profiling, uint deviceQueueSize, uint rtCUs,
   }
 
   // Create buffers for kernel arg management
-  if (!managedBuffer_.create(
-      dev().settings().useDeviceKernelArg_ ? Resource::Persistent : Resource::RemoteUSWC)) {
+  if (!managedBuffer_.create(dev().settings().kernel_arg_impl_ ==
+                                     KernelArgImpl::DeviceKernelArgs
+                                 ? Resource::Persistent
+                                 : Resource::RemoteUSWC)) {
     // Try just USWC if persistent memory failed
-    if (dev().settings().useDeviceKernelArg_) {
+    if (dev().settings().kernel_arg_impl_ == KernelArgImpl::DeviceKernelArgs) {
       if (!managedBuffer_.create(Resource::RemoteUSWC)) {
         return false;
       }
@@ -1061,14 +1063,17 @@ VirtualGPU::~VirtualGPU() {
   amd::ScopedLock k(dev().lockAsyncOps());
   amd::ScopedLock lock(dev().vgpusAccess());
 
-  // Clear all timestamps, associated with this virtual GPU
-  auto& mgmt = *queues_[MainEngine]->aql_mgmt_;
-  for (uint32_t i = 0; i < AqlPacketMgmt::kAqlPacketsListSize; ++i) {
-    if (mgmt.aql_vgpus_[i] == this) {
-      mgmt.aql_vgpus_[i] = nullptr;
-      mgmt.aql_events_[i].invalidate();
+  if (queues_[MainEngine] != nullptr) {
+    // Clear all timestamps, associated with this virtual GPU
+    auto& mgmt = *queues_[MainEngine]->aql_mgmt_;
+    for (uint32_t i = 0; i < AqlPacketMgmt::kAqlPacketsListSize; ++i) {
+      if (mgmt.aql_vgpus_[i] == this) {
+        mgmt.aql_vgpus_[i] = nullptr;
+        mgmt.aql_events_[i].invalidate();
+      }
     }
   }
+
   // Destroy RGP trace
   if (rgpCaptureEna()) {
     dev().rgpCaptureMgr()->FinishRGPTrace(this, true);
@@ -1151,7 +1156,7 @@ VirtualGPU::~VirtualGPU() {
             "deleting hostcall buffer %p for virtual queue %p",
             hostcallBuffer_, this);
     disableHostcalls(hostcallBuffer_);
-    dev().context().svmFree(hostcallBuffer_);
+    dev().svmFree(hostcallBuffer_);
   }
 }
 
@@ -1564,7 +1569,7 @@ void VirtualGPU::submitSvmCopyMemory(amd::SvmCopyMemoryCommand& vcmd) {
     }
 
     if (nullptr == srcMem && nullptr == dstMem) {  // both not in svm space
-      amd::Os::fastMemcpy(vcmd.dst(), vcmd.src(), vcmd.srcSize());
+      std::memcpy(vcmd.dst(), vcmd.src(), vcmd.srcSize());
       result = true;
     } else if (nullptr == srcMem && nullptr != dstMem) {  // src not in svm space
       Memory* memory = dev().getGpuMemory(dstMem);
@@ -2189,18 +2194,18 @@ void VirtualGPU::submitVirtualMap(amd::VirtualMapCommand& vcmd) {
   amd::ScopedLock lock(execution());
 
   profilingBegin(vcmd);
-  amd::Memory* va = amd::MemObjMap::FindVirtualMemObj(vcmd.ptr());
-  if (va == nullptr || !(va->getMemFlags() & CL_MEM_VA_RANGE_AMD)) {
+  amd::Memory* vaddr_mem_obj = amd::MemObjMap::FindVirtualMemObj(vcmd.ptr());
+  if (vaddr_mem_obj == nullptr || !(vaddr_mem_obj->getMemFlags() & CL_MEM_VA_RANGE_AMD)) {
     profilingEnd(vcmd);
     return;
   }
-  pal::Memory* vaRange = dev().getGpuMemory(va);
-  Pal::IGpuMemory* memory = (vcmd.memory() == nullptr) ?
+  pal::Memory* vaddr_pal_mem = dev().getGpuMemory(vaddr_mem_obj);
+  Pal::IGpuMemory* phymem_igpu_mem = (vcmd.memory() == nullptr) ?
       nullptr : dev().getGpuMemory(vcmd.memory())->iMem();
   Pal::VirtualMemoryRemapRange range{
-    vaRange->iMem(),
+    vaddr_pal_mem->iMem(),
     0,
-    memory,
+    phymem_igpu_mem,
     0,
     vcmd.size(),
     Pal::VirtualGpuMemAccessMode::NoAccess
@@ -2221,13 +2226,19 @@ void VirtualGPU::submitVirtualMap(amd::VirtualMapCommand& vcmd) {
   setGpuEvent(event);
   if (result == Pal::Result::Success) {
     if (vcmd.memory() != nullptr) {
-      // assert the va wasn't mapped already
+      // assert the vaddr_mem_obj wasn't mapped already
       assert(amd::MemObjMap::FindMemObj(vcmd.ptr()) == nullptr);
-      amd::MemObjMap::AddMemObj(vcmd.ptr(), vcmd.memory());
+      amd::MemObjMap::AddMemObj(vcmd.ptr(), vaddr_mem_obj);
+      vaddr_mem_obj->getUserData().phys_mem_obj = vcmd.memory();
+      vcmd.memory()->getUserData().vaddr_mem_obj = vaddr_mem_obj;
     } else {
-      // assert the va is mapped and needs to be removed
+      // assert the vaddr_mem_obj is mapped and needs to be removed
       assert(amd::MemObjMap::FindMemObj(vcmd.ptr()) != nullptr);
       amd::MemObjMap::RemoveMemObj(vcmd.ptr());
+      if (vaddr_mem_obj->getUserData().phys_mem_obj != nullptr) {
+        vaddr_mem_obj->getUserData().phys_mem_obj->getUserData().vaddr_mem_obj = nullptr;
+        vaddr_mem_obj->getUserData().phys_mem_obj = nullptr;
+      }
     }
   }
   profilingEnd(vcmd);
@@ -2399,8 +2410,7 @@ void VirtualGPU::PostDeviceEnqueue(const amd::Kernel& kernel, const HSAILKernel&
   static_cast<KernelBlitManager&>(gpuDefQueue->blitMgr())
       .runScheduler(*gpuDefQueue->virtualQueue_, *gpuDefQueue->schedParams_, 0,
                     gpuDefQueue->vqHeader_->aql_slot_num / (DeviceQueueMaskSize * maskGroups_));
-  const static bool FlushL2 = true;
-  gpuDefQueue->addBarrier(RgpSqqtBarrierReason::PostDeviceEnqueue, FlushL2);
+  gpuDefQueue->addBarrier(RgpSqqtBarrierReason::PostDeviceEnqueue, BarrierType::FlushL2);
 
   // Get the address of PM4 template and add write it to params
   //! @note DMA flush must not occur between patch and the scheduler
@@ -3015,8 +3025,7 @@ void VirtualGPU::submitSignal(amd::SignalCommand& vcmd) {
     engineID_ = static_cast<EngineType>(pGpuMemory->getGpuEvent(*this)->engineId_);
 
     // Make sure GPU finished operation and data reached memory before the marker write
-    static constexpr bool FlushL2 = true;
-    addBarrier(RgpSqqtBarrierReason::SignalSubmit, FlushL2);
+    addBarrier(RgpSqqtBarrierReason::SignalSubmit, BarrierType::FlushL2);
     // Workarounds: We had systems where an extra delay was necessary.
     {
       // Flush CB associated with the DGMA buffer
@@ -3314,7 +3323,7 @@ void VirtualGPU::profilingBegin(amd::Command& command, bool drmProfiling) {
       return;
     }
     // Save the TimeStamp object in the current OCL event
-    command.setData(ts);
+    command.data().emplace_back(ts);
     profileTs_ = ts;
     state_.profileEnabled_ = true;
   }
@@ -3322,7 +3331,8 @@ void VirtualGPU::profilingBegin(amd::Command& command, bool drmProfiling) {
 
 void VirtualGPU::profilingEnd(amd::Command& command) {
   // Get the TimeStamp object associated witht the current command
-  TimeStamp* ts = reinterpret_cast<TimeStamp*>(command.data());
+  TimeStamp* ts = !command.data().empty() ? reinterpret_cast<TimeStamp*>(command.data().back())
+                                            : nullptr;
   if (ts != nullptr) {
     // Check if the command actually did any GPU submission
     if (ts->isValid()) {
@@ -3330,7 +3340,7 @@ void VirtualGPU::profilingEnd(amd::Command& command) {
     } else {
       // Destroy the TimeStamp object
       tsCache_->freeTimeStamp(ts);
-      command.setData(nullptr);
+      command.data().clear();
     }
   }
 }
@@ -3359,7 +3369,8 @@ bool VirtualGPU::profilingCollectResults(CommandBatch* cb, const amd::Event* wai
   first = cb->head_;
   while (nullptr != first) {
     // Get the TimeStamp object associated witht the current command
-    TimeStamp* ts = reinterpret_cast<TimeStamp*>(first->data());
+    TimeStamp* ts = !first->data().empty() ? reinterpret_cast<TimeStamp*>(first->data().back())
+                                            : nullptr;
 
     if (ts != nullptr) {
       ts->value(&startTimeStamp, &endTimeStamp);
@@ -3376,7 +3387,8 @@ bool VirtualGPU::profilingCollectResults(CommandBatch* cb, const amd::Event* wai
   first = cb->head_;
   while (nullptr != first) {
     // Get the TimeStamp object associated witht the current command
-    TimeStamp* ts = reinterpret_cast<TimeStamp*>(first->data());
+    TimeStamp* ts = !first->data().empty() ? reinterpret_cast<TimeStamp*>(first->data().back())
+                                            : nullptr;
 
     current = first->getNext();
 
@@ -3386,7 +3398,7 @@ bool VirtualGPU::profilingCollectResults(CommandBatch* cb, const amd::Event* wai
       startTimeStamp -= readjustTimeGPU_;
       // Destroy the TimeStamp object
       tsCache_->freeTimeStamp(ts);
-      first->setData(nullptr);
+      first->data().clear();
     } else {
       // For empty commands start/end is equal to
       // the end of the last valid command
@@ -3760,7 +3772,8 @@ void* VirtualGPU::getOrCreateHostcallBuffer() {
   auto size = getHostcallBufferSize(numPackets);
   auto align = getHostcallBufferAlignment();
 
-  hostcallBuffer_ = dev().context().svmAlloc(size, align, CL_MEM_SVM_FINE_GRAIN_BUFFER | CL_MEM_SVM_ATOMICS);
+  hostcallBuffer_ = dev().svmAlloc(dev().context(), size, align,
+                                   CL_MEM_SVM_FINE_GRAIN_BUFFER | CL_MEM_SVM_ATOMICS, nullptr);
   if (!hostcallBuffer_) {
     ClPrint(amd::LOG_ERROR, amd::LOG_QUEUE,
             "Failed to create hostcall buffer");

@@ -547,3 +547,22 @@ global:
 local:
     *;
 } hip_5.6;
+
+hip_6.1 {
+global:
+    hipGraphInstantiateWithParams;
+    hipGetProcAddress;
+    hipStreamBeginCaptureToGraph;
+local:
+    *;
+} hip_6.0;
+
+hip_6.2 {
+global:
+    hipGetFuncBySymbol;
+    hipDrvGraphExecMemcpyNodeSetParams;
+    hipDrvGraphExecMemsetNodeSetParams;
+    hipDrvGraphAddMemFreeNode;
+local:
+    *;
+} hip_6.1;

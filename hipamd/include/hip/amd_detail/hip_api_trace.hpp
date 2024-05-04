@@ -1,5 +1,5 @@
 /*
-    Copyright (c) 2023 Advanced Micro Devices, Inc. All rights reserved.
+    Copyright (c) 2023 - 2024 Advanced Micro Devices, Inc. All rights reserved.
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to deal
@@ -51,8 +51,8 @@
 //   HipCompilerDispatchTable struct, such as a *change* to type/name an existing member variable.
 //   DO NOT REMOVE IT.
 #define HIP_API_TABLE_MAJOR_VERSION 0
-#define HIP_RUNTIME_API_TABLE_MAJOR_VERSION 0
 #define HIP_COMPILER_API_TABLE_MAJOR_VERSION 0
+#define HIP_RUNTIME_API_TABLE_MAJOR_VERSION 0
 
 // The step version number should be changed whenever the size of the API table struct(s) change.
 // - Increment the HIP_API_TABLE_STEP_VERSION when/if new API table structs are added
@@ -60,8 +60,8 @@
 // - Increment the HIP_COMPILER_API_TABLE_STEP_VERSION when new compiler API functions are added
 // - Reset any of the *_STEP_VERSION defines to zero if the corresponding *_MAJOR_VERSION increases
 #define HIP_API_TABLE_STEP_VERSION 0
-#define HIP_RUNTIME_API_TABLE_STEP_VERSION 0
 #define HIP_COMPILER_API_TABLE_STEP_VERSION 0
+#define HIP_RUNTIME_API_TABLE_STEP_VERSION 3
 
 // HIP API interface
 typedef hipError_t (*t___hipPopCallConfiguration)(dim3* gridDim, dim3* blockDim, size_t* sharedMem,
@@ -907,7 +907,6 @@ typedef hipError_t (*t_hipHccModuleLaunchKernel)(hipFunction_t f, uint32_t globa
                                                  void** extra, hipEvent_t startEvent,
                                                  hipEvent_t stopEvent);
 typedef int (*t_hipGetStreamDeviceId)(hipStream_t stream);
-
 typedef hipError_t (*t_hipDrvGraphAddMemsetNode)(hipGraphNode_t* phGraphNode, hipGraph_t hGraph,
                                  const hipGraphNode_t* dependencies, size_t numDependencies,
                                  const HIP_MEMSET_NODE_PARAMS* memsetParams, hipCtx_t ctx);
@@ -917,7 +916,7 @@ typedef hipError_t (*t_hipGraphAddExternalSemaphoresWaitNode)(hipGraphNode_t* pG
                                const hipExternalSemaphoreWaitNodeParams* nodeParams);
 typedef hipError_t (*t_hipGraphAddExternalSemaphoresSignalNode)(hipGraphNode_t* pGraphNode,
                                hipGraph_t graph, const hipGraphNode_t* pDependencies,
-                               size_t numDependencies, 
+                               size_t numDependencies,
                                const hipExternalSemaphoreSignalNodeParams* nodeParams);
 typedef hipError_t (*t_hipGraphExternalSemaphoresSignalNodeSetParams)(hipGraphNode_t hNode,
                                             const hipExternalSemaphoreSignalNodeParams* nodeParams);
@@ -936,7 +935,36 @@ typedef hipError_t (*t_hipGraphExecExternalSemaphoresWaitNodeSetParams)(hipGraph
 typedef hipError_t (*t_hipGraphAddNode)(hipGraphNode_t *pGraphNode, hipGraph_t graph,
                            const hipGraphNode_t *pDependencies, size_t numDependencies,
                            hipGraphNodeParams *nodeParams);
+typedef hipError_t (*t_hipGraphInstantiateWithParams)(hipGraphExec_t* pGraphExec, hipGraph_t graph,
+                                                     hipGraphInstantiateParams* instantiateParams);
 typedef hipError_t (*t_hipExtGetLastError)();
+typedef hipError_t (*t_hipTexRefGetBorderColor)(float* pBorderColor,
+                                                const textureReference* texRef);
+typedef hipError_t (*t_hipTexRefGetArray)(hipArray_t* pArray, const textureReference* texRef);
+
+typedef hipError_t (*t_hipTexRefGetBorderColor)(float* pBorderColor,
+                                                const textureReference* texRef);
+typedef hipError_t (*t_hipTexRefGetArray)(hipArray_t* pArray, const textureReference* texRef);
+typedef hipError_t (*t_hipGetProcAddress)(const char* symbol, void** pfn, int  hipVersion, uint64_t flags,
+                                          hipDriverProcAddressQueryResult* symbolStatus);
+typedef hipError_t (*t_hipStreamBeginCaptureToGraph)(hipStream_t stream, hipGraph_t graph,
+                                                     const hipGraphNode_t* dependencies,
+                                                     const hipGraphEdgeData* dependencyData,
+                                                     size_t numDependencies,
+                                                     hipStreamCaptureMode mode);
+typedef hipError_t (*t_hipGetFuncBySymbol)(hipFunction_t* functionPtr, const void* symbolPtr);
+
+typedef hipError_t (*t_hipDrvGraphAddMemFreeNode)(hipGraphNode_t* phGraphNode, hipGraph_t hGraph,
+                                  const hipGraphNode_t* dependencies, size_t numDependencies,
+                                  hipDeviceptr_t dptr);
+
+typedef hipError_t (*t_hipDrvGraphExecMemcpyNodeSetParams)(hipGraphExec_t hGraphExec,
+                                   hipGraphNode_t hNode, const HIP_MEMCPY3D* copyParams,
+                                   hipCtx_t ctx);
+
+typedef hipError_t (*t_hipDrvGraphExecMemsetNodeSetParams)(hipGraphExec_t hGraphExec,
+                                   hipGraphNode_t hNode, const HIP_MEMSET_NODE_PARAMS* memsetParams,
+                                   hipCtx_t ctx);
 
 // HIP Compiler dispatch table
 struct HipCompilerDispatchTable {
@@ -1397,5 +1425,14 @@ struct HipDispatchTable {
   t_hipGraphExecExternalSemaphoresSignalNodeSetParams hipGraphExecExternalSemaphoresSignalNodeSetParams_fn;
   t_hipGraphExecExternalSemaphoresWaitNodeSetParams hipGraphExecExternalSemaphoresWaitNodeSetParams_fn;
   t_hipGraphAddNode hipGraphAddNode_fn;
+  t_hipGraphInstantiateWithParams hipGraphInstantiateWithParams_fn;
   t_hipExtGetLastError hipExtGetLastError_fn;
+  t_hipTexRefGetBorderColor hipTexRefGetBorderColor_fn;
+  t_hipTexRefGetArray hipTexRefGetArray_fn;
+  t_hipGetProcAddress hipGetProcAddress_fn;
+  t_hipStreamBeginCaptureToGraph hipStreamBeginCaptureToGraph_fn;
+  t_hipGetFuncBySymbol hipGetFuncBySymbol_fn;
+  t_hipDrvGraphAddMemFreeNode hipDrvGraphAddMemFreeNode_fn;
+  t_hipDrvGraphExecMemcpyNodeSetParams hipDrvGraphExecMemcpyNodeSetParams_fn;
+  t_hipDrvGraphExecMemsetNodeSetParams hipDrvGraphExecMemsetNodeSetParams_fn;
 };
