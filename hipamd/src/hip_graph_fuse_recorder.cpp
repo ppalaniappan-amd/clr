@@ -38,6 +38,7 @@ template <typename T> void append(std::vector<T>& vec) { vec.push_back(T()); };
 namespace hip {
 bool GraphFuseRecorder::isRecordingStateQueried_{false};
 bool GraphFuseRecorder::isRecordingSwitchedOn_{false};
+std::string GraphFuseRecorder::fusionDumpGraph_{};
 std::string GraphFuseRecorder::tmpDirName_{};
 GraphFuseRecorder::ImageCacheType GraphFuseRecorder::imageCache_{};
 std::vector<std::string> GraphFuseRecorder::savedFusionConfigs_{};
@@ -80,6 +81,20 @@ bool GraphFuseRecorder::isInputOk() {
   }
   if (!enabled(std::string(env))) {
     return false;
+  }
+
+  env = getenv("AMD_FUSION_DUMP_GRAPH");
+  if (env != nullptr) {
+    if (enabled(std::string(env))) {
+      GraphFuseRecorder::fusionDumpGraph_ = "ON";
+    }
+    if (GraphFuseRecorder::fusionDumpGraph_ == "") {
+      std::stringstream msg;
+      msg << "failed to enable dumping of kernel resource yaml for captured graph";
+      LogPrintfError("%s", msg.str().c_str());
+    } else {
+      LogPrintfInfo("%s", "dumping of kernel resource yaml for captured graph enabled");
+    }
   }
 
   env = getenv("AMD_FUSION_CONFIG");
@@ -168,17 +183,18 @@ void GraphFuseRecorder::run() {
 }
 
 bool GraphFuseRecorder::findCandidates(const std::vector<Node>& nodes) {
-  for (size_t i = 0; i < nodes.size() - 1; ++i) {
-    auto& node = nodes[i];
-    const auto outDegree = node->GetOutDegree();
-    if (outDegree != 1) {
-      std::stringstream msg;
-      msg << "cannot perform fusion because node `" << i << "` contains multiple output edges. "
-          << "Number of output edges equals " << outDegree;
-      LogPrintfError("%s", msg.str().c_str());
-      return false;
-    }
-  }
+  // TODO: Need to asses how nodes with outDegree/inDegree > 1 will need to be processed
+  // for (size_t i = 0; i < nodes.size() - 1; ++i) {
+  //   auto& node = nodes[i];
+  //   const auto outDegree = node->GetOutDegree();
+  //   if (outDegree != 1) {
+  //     std::stringstream msg;
+  //     msg << "cannot perform fusion because node `" << i << "` contains multiple output edges. "
+  //         << "Number of output edges equals " << outDegree;
+  //     LogPrintfError("%s", msg.str().c_str());
+  //     return false;
+  //   }
+  // }
 
   fusionGroups_.push_back(std::vector<Node>());
   fusedExecutionOrder_.push_back(std::vector<size_t>());
@@ -207,6 +223,7 @@ bool GraphFuseRecorder::findCandidates(const std::vector<Node>& nodes) {
       if (!isBlockSizeEqual) {
         append(fusionGroups_);
         append(fusedExecutionOrder_);
+        referenceBlockSize = params.blockDim;
       }
       fusionGroups_.back().push_back(node);
       fusedExecutionOrder_.back().push_back(i);
@@ -214,7 +231,6 @@ bool GraphFuseRecorder::findCandidates(const std::vector<Node>& nodes) {
 
     if (type != hipGraphNodeTypeKernel) {
       isRecording = false;
-
       append(fusedExecutionOrder_);
       fusedExecutionOrder_.back().push_back(i);
       continue;
@@ -289,6 +305,41 @@ GraphFuseRecorder::KernelDescriptions GraphFuseRecorder::collectImages(
   return descriptions;
 }
 
+void GraphFuseRecorder::saveGraphResourceUsage(std::vector<KernelDescription>& fullGraphDescriptions) {
+  YAML::Emitter out;
+  out << YAML::BeginMap;
+  out << YAML::Key << "total-graph-nodes" << YAML::Value << fullGraphDescriptions.size() << YAML::Newline;
+  out << YAML::Key << "kernels" << YAML::Value << YAML::BeginSeq;
+  for (const auto& desc : fullGraphDescriptions) {
+    out << YAML::BeginMap;
+    out << YAML::Key << "kernel-name";
+    out << YAML::Value << desc.name;
+    out << YAML::Key << "node-ID";
+    out << YAML::Value << desc.nodeID;
+    out << YAML::Key << "in-degree";
+    out << YAML::Value << desc.inDegree;
+    out << YAML::Key << "out-degree";
+    out << YAML::Value << desc.outDegree;
+    out << YAML::Key << "grid-dim";
+    out << YAML::Value << YAML::Flow << YAML::BeginSeq << desc.gridDim.x << desc.gridDim.y << desc.gridDim.z << YAML::EndSeq;
+    out << YAML::Key << "block-dim";
+    out << YAML::Value << YAML::Flow << YAML::BeginSeq << desc.blockDim.x << desc.blockDim.y << desc.blockDim.z << YAML::EndSeq;
+    out << YAML::EndMap;
+  }
+  out << YAML::EndSeq << YAML::EndMap;
+
+  auto fileName = std::string("graph") + std::to_string(instanceId_) + std::string("-info") + std::string(".yaml");
+  auto configPath = GraphFuseRecorder::generateFilePath(fileName);
+  auto configFile = std::fstream(configPath.c_str(), std::ios_base::out);
+  if (configFile) {
+    configFile << out.c_str() << "\n";
+  } else {
+    std::stringstream msg;
+    msg << "failed to write full yaml graph resources usage information to `" << configPath.c_str() << "`";
+    LogPrintfError("%s", msg.str().c_str());
+  }
+}
+
 void GraphFuseRecorder::saveImageToDisk(ImageHandle& imageHandle) {
   if (imageHandle.imageSize_ > 0) {
     auto iamgeFile =
@@ -337,7 +388,10 @@ void GraphFuseRecorder::saveFusionConfig(std::vector<KernelDescriptions>& groupD
       out << YAML::Key << "gridDim" << YAML::Value << YAML::Flow << YAML::BeginSeq
           << description.gridDim.x << description.gridDim.y << description.gridDim.z
           << YAML::EndSeq;
-
+      out << YAML::Key << "blockDim" << YAML::Value << YAML::Flow << YAML::BeginSeq
+          << description.blockDim.x << description.blockDim.y << description.blockDim.z
+          << YAML::EndSeq;
+          
       out << YAML::Key << "argSizes" << YAML::Value << YAML::Flow << YAML::BeginSeq;
       for (const auto argSize : description.argsSizes) {
         out << argSize;
