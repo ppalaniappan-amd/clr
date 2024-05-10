@@ -180,6 +180,11 @@ void GraphFuseRecorder::run() {
     groupDescriptions.push_back(description);
   }
   saveFusionConfig(groupDescriptions);
+  
+  if (GraphFuseRecorder::fusionDumpGraph_ == "ON") {
+    auto fullGraphDescriptions = extractGraphResourceUsage(nodes);
+    saveGraphResourceUsage(fullGraphDescriptions);
+  }
 }
 
 bool GraphFuseRecorder::findCandidates(const std::vector<Node>& nodes) {
