@@ -123,9 +123,8 @@ class PlatformState {
   hip::ExternalCOs externalCOs_;  // External Code objects
   bool initialized_{false};
   std::unordered_map<textureReference*, std::pair<hipModule_t, std::string>> texRef_map_;
-
   std::unordered_map<std::string, std::shared_ptr<UniqueFD>> ufd_map_; //!< Unique File Desc Map
-
   void* dynamicLibraryHandle_{nullptr};
+  void* semaphore_{nullptr}; // !< Semaphore value for the binary kernel fusion project
 };
 }  // namespace hip
