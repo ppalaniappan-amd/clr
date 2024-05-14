@@ -263,6 +263,28 @@ bool GraphFuseRecorder::findCandidates(const std::vector<Node>& nodes) {
   return true;
 }
 
+GraphFuseRecorder::KernelDescriptions GraphFuseRecorder::extractGraphResourceUsage(const std::vector<Node>& nodes) {
+  KernelDescriptions descriptions{};
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    auto& node = nodes[i];
+    const auto type = node->GetType();
+    if (type == hipGraphNodeTypeKernel) {
+      KernelDescription descr{};
+      descr.inDegree = node->GetInDegree();
+      descr.outDegree = node->GetOutDegree();
+      descr.nodeID = node->GetID();
+      auto params = GraphFuseRecorder::getKernelNodeParams(node);
+      auto* kernel = GraphFuseRecorder::getDeviceKernel(params);
+      descr.name = kernel->name();
+      descr.gridDim = params.gridDim;
+      descr.blockDim = params.blockDim;
+      rtrim(descr.name);
+      descriptions.push_back(descr);
+    }
+  }
+  return descriptions;
+}
+
 GraphFuseRecorder::KernelDescriptions GraphFuseRecorder::collectImages(
     const std::vector<Node>& group) {
   const auto& devices = hip::getCurrentDevice()->devices();
