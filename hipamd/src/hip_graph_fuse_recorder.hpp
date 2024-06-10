@@ -67,6 +67,7 @@ class GraphFuseRecorder {
 
   bool findCandidates(const std::vector<Node>& nodes);
   KernelDescriptions collectImages(const std::vector<Node>& nodes);
+  KernelDescriptions extractGraphResourceUsage(const std::vector<Node>& nodes);
   void saveGraphResourceUsage(std::vector<KernelDescription>& fullGraphDescriptions);
   void saveImageToDisk(ImageHandle& imageHandle);
   void saveFusionConfig(std::vector<KernelDescriptions>& groupDescriptions);
