@@ -298,6 +298,7 @@ GraphFuseRecorder::KernelDescriptions GraphFuseRecorder::collectImages(
     const auto& node = group[i];
     auto params = GraphFuseRecorder::getKernelNodeParams(node);
     descr.gridDim = params.gridDim;
+    descr.blockDim = params.blockDim;
 
     auto* kernel = GraphFuseRecorder::getDeviceKernel(params);
     descr.name = kernel->name();
