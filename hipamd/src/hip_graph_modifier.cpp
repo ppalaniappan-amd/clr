@@ -45,7 +45,9 @@ class FusionGroup : public hip::GraphNode {
   void dumpExtra(hipKernelNodeParams nodeParams);
   void dumpDescriptor(amd::Kernel* kernel);
   char* clk_value_type_to_string(clk_value_type_t type);
-  void insertAlignKernarg(size_t alignment, uint8_t* kernarg, size_t kernargSize, size_t* kernargs_combined_size);
+  void insertAlignKernargSegment(size_t alignment, uint8_t* kernarg, size_t kernargSize, size_t* kernelArgsCombinedSize);
+  void insertKernarg(void* kernarg, size_t kernargSize, size_t* kernelArgsCombinedSize);
+  void alignKernargSegment(size_t alignment, size_t* kernelArgsCombinedSize);
   void generateNode(void* functionHandle);
   hipKernelNodeParams* getNodeParams() { return &fusedNodeParams_; }
 
@@ -55,7 +57,7 @@ class FusionGroup : public hip::GraphNode {
   hip::GraphKernelNode* fusedNode_;
   hipKernelNodeParams fusedNodeParams_{};
   std::vector<void*> kernelArgs_{};
-  std::vector<uint8_t> gemmKernelArgs_{};
+  std::vector<uint8_t> mixedKernelArgs_{};
   std::vector<void*> hiddenkernelArgs_{};
   void* semaphore_{};
 };
@@ -132,15 +134,37 @@ void FusionGroup::dumpExtra(hipKernelNodeParams nodeParams) {
   }
 }
 
-void FusionGroup::insertAlignKernarg(size_t alignment, uint8_t* kernarg, size_t kernargSize, size_t* kernargs_combined_size) {
+void FusionGroup::insertKernarg(void* kernarg, size_t kernargSize, size_t* kernelArgsCombinedSize) {
+  // Get current size
+  size_t currentSize = mixedKernelArgs_.size();
+  // Resize the vector
+  mixedKernelArgs_.resize(currentSize + kernargSize);
+  // Insert the argument
+  std::memcpy(mixedKernelArgs_.data() + currentSize, kernarg, kernargSize);
+  // Update combined kernarg size to the most recently added kernarg
+  *kernelArgsCombinedSize += kernargSize;
+}
+
+void FusionGroup::alignKernargSegment(size_t alignment, size_t* kernelArgsCombinedSize) {
+  // Calculate the current size of mixedKernelArgs_
+  size_t currentSize = mixedKernelArgs_.size();
+  // Calculate the padding needed to align one whole kernarg segment to the appropriate alignment
+  size_t padding = (alignment - (currentSize % alignment)) % alignment;
+  // Insert padding
+  mixedKernelArgs_.insert(mixedKernelArgs_.end(), padding, 0);
+  // Update combined kernarg to account for the extra memory used to align a whole segment to alignment size
+  *kernelArgsCombinedSize += padding;
+}
+
+void FusionGroup::insertAlignKernargSegment(size_t alignment, uint8_t* kernarg, size_t kernargSize, size_t* kernelArgsCombinedSize) {
   // Calculate the padding needed to align to alignment bytes
   size_t padding = (alignment - (kernargSize % alignment)) % alignment;
   // Insert the new data
-  gemmKernelArgs_.insert(gemmKernelArgs_.end(), kernarg, kernarg + kernargSize);
+  mixedKernelArgs_.insert(mixedKernelArgs_.end(), kernarg, kernarg + kernargSize);
   // Insert padding bytes
-  gemmKernelArgs_.insert(gemmKernelArgs_.end(), padding, 0);
+  mixedKernelArgs_.insert(mixedKernelArgs_.end(), padding, 0);
   // Update combined kernel arg size to account for the extra memory used to align to alignment size
-  *kernargs_combined_size += padding;
+  *kernelArgsCombinedSize += padding;
 }
 
 void FusionGroup::generateNode(void* functionHandle) {
@@ -148,7 +172,7 @@ void FusionGroup::generateNode(void* functionHandle) {
   fusedNodeParams_.gridDim = dim3(0, 0, 0);
   fusedNodeParams_.sharedMemBytes = 0;
   fusedNodeParams_.func = functionHandle;
-  size_t kernargs_combined_size = 0;
+  size_t kernelArgsCombinedSize = 0;
 
   // Allocate the extra buffer one time at the beginning
   fusedNodeParams_.extra = (void**)malloc(5 * sizeof(void*));
@@ -156,6 +180,17 @@ void FusionGroup::generateNode(void* functionHandle) {
     ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "FusionGroup::generateNode() - HIP error out of memory for allocating extra!");
   }
 
+  // Decide ahead of time what kind of fusion this group will be
+  // Hybrid = (asm kernels + hip kernels), or HIP only, or ASM only
+  bool fromHIP = false;
+  bool fromASM = false;
+  for (auto* node: fusee_) {
+    auto nodeParams = hip::GraphFuseRecorder::getKernelNodeParams(node);
+    if (nodeParams.kernelParams != nullptr && nodeParams.extra == nullptr) fromHIP = true;
+    if (nodeParams.kernelParams == nullptr && nodeParams.extra != nullptr) fromASM = true;
+  }
+
+  // Aggregate kernel args for the fused node based on hybrid fusion or homogenous fusioon
   for (auto* node : fusee_) {
     auto nodeParams = hip::GraphFuseRecorder::getKernelNodeParams(node);
     fusedNodeParams_.blockDim = max(fusedNodeParams_.blockDim, nodeParams.blockDim);
@@ -163,18 +198,28 @@ void FusionGroup::generateNode(void* functionHandle) {
     fusedNodeParams_.sharedMemBytes = std::max(fusedNodeParams_.sharedMemBytes, nodeParams.sharedMemBytes);
 
     auto* kernel = hip::GraphFuseRecorder::getDeviceKernel(nodeParams);
-    const auto numKernelArgsAndHidden = kernel->signature().numParametersAll();
-    const auto numKernelArgs = kernel->signature().numParameters();
-    ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "# Kernel args + hidden: %d", numKernelArgsAndHidden);
+    const amd::KernelSignature& signature = kernel->signature();
+    const auto numKernelArgsAndHidden = signature.numParametersAll();
+    const auto numKernelArgs = signature.numParameters();
+    ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "# Kernel args + hidden kernel args: %d", numKernelArgsAndHidden);
     ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "# Kernel args: %d", numKernelArgs);
 
-    ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "FusionGroup::generateNode() - Dumping out descriptors for node in fusee_!");
+    ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "FusionGroup::generateNode() - Dumping out descriptors for node in fusee_");
     dumpDescriptor(kernel);
-    ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "FusionGroup::generateNode() - Dumping out nodeParams->extra for node in fusee_!");
-    dumpExtra(nodeParams);
 
-    // Populate from the extra struct if kernel args are not passed from  kernelParams
-    if (nodeParams.kernelParams == nullptr) {
+    // 1. All kernels are from HIP
+    if (fromHIP && !fromASM) {
+      ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "FusionGroup::generateNode() - Current node is from HIP");
+      for (size_t i = 0; i < numKernelArgsAndHidden; ++i) {
+        if (kernel->signature().at(i).info_.hidden_) hiddenkernelArgs_.push_back(nodeParams.kernelParams[i]);
+        else kernelArgs_.push_back(nodeParams.kernelParams[i]);
+      }
+    
+    // 2. All kernels are from ASM  
+    } else if (!fromHIP && fromASM) {
+      ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "FusionGroup::generateNode() - Current node is from ASM");
+      ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "FusionGroup::generateNode() - Dumping out nodeParams->extra for current node in fusee_");
+      dumpExtra(nodeParams);
       // 'extra' is a struct that contains the following info: 
       // {
         // HIP_LAUNCH_PARAM_BUFFER_POINTER, kernargs,
@@ -184,46 +229,80 @@ void FusionGroup::generateNode(void* functionHandle) {
       fusedNodeParams_.extra[0] = nodeParams.extra[0]; // HIP_LAUNCH_PARAM_BUFFER_POINTER
       fusedNodeParams_.extra[2] = nodeParams.extra[2]; // HIP_LAUNCH_PARAM_BUFFER_SIZE
       fusedNodeParams_.extra[4] = nodeParams.extra[4]; // HIP_LAUNCH_PARAM_END
-      kernargs_combined_size += *((size_t*)nodeParams.extra[3]); // += kernargs_size
+      kernelArgsCombinedSize += *((size_t*)nodeParams.extra[3]); // += kernargs_size
       // We cast it back to uint8_t since kernargs are actually stored as this: 
       // https://github.com/ROCm/hipBLASLt/blob/33e633fe2a270dd5c3a8b0e4ed12147f77d32761/tensilelite/Tensile/Source/lib/include/Tensile/KernelArguments.hpp#L227
       uint8_t* kernargs = static_cast<uint8_t*>(nodeParams.extra[1]);
-      insertAlignKernarg(8, kernargs, *((size_t*)nodeParams.extra[3]), &kernargs_combined_size);
+      insertAlignKernargSegment(8, kernargs, *((size_t*)nodeParams.extra[3]), &kernelArgsCombinedSize);
+    
+    // 3. Mix of kernels from HIP and ASM
     } else {
-      for (size_t i = 0; i < numKernelArgsAndHidden; ++i) {
-        if (kernel->signature().at(i).info_.hidden_) hiddenkernelArgs_.push_back(nodeParams.kernelParams[i]);
-        else kernelArgs_.push_back(nodeParams.kernelParams[i]);
+      ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "FusionGroup::generateNode() - Mix of kernels from HIP & ASM");
+      // Current node in this mix is from HIP
+      if (nodeParams.kernelParams != nullptr && nodeParams.extra == nullptr) {
+        ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "FusionGroup::generateNode() - Current node of the mix is from HIP");
+        // for (size_t i = 0; i < numKernelArgsAndHidden; ++i) {
+        //   if (kernel->signature().at(i).info_.hidden_) hiddenkernelArgs_.push_back(nodeParams.kernelParams[i]);
+        //   else kernelArgs_.push_back(nodeParams.kernelParams[i]);
+        // }
+        for (size_t i = 0; i < numKernelArgsAndHidden; ++i) {
+          const amd::KernelParameterDescriptor& desc = signature.at(i);
+          insertKernarg(nodeParams.kernelParams[i], desc.size_, &kernelArgsCombinedSize);
+        }
+        alignKernargSegment(8, &kernelArgsCombinedSize);
+      // Current node in this mix is from ASM  
+      } else {
+        ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "FusionGroup::generateNode() - Current node of the mix is from ASM");
+        ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "FusionGroup::generateNode() - Dumping out nodeParams->extra for current node in the mix");
+        dumpExtra(nodeParams);
+        // 'extra' is a struct that contains the following info: 
+        // {
+          // HIP_LAUNCH_PARAM_BUFFER_POINTER, kernargs,
+          // HIP_LAUNCH_PARAM_BUFFER_SIZE, &kernargs_size,
+          // HIP_LAUNCH_PARAM_END 
+        // }
+        fusedNodeParams_.extra[0] = nodeParams.extra[0]; // HIP_LAUNCH_PARAM_BUFFER_POINTER
+        fusedNodeParams_.extra[2] = nodeParams.extra[2]; // HIP_LAUNCH_PARAM_BUFFER_SIZE
+        fusedNodeParams_.extra[4] = nodeParams.extra[4]; // HIP_LAUNCH_PARAM_END
+        kernelArgsCombinedSize += *((size_t*)nodeParams.extra[3]); // += kernargs_size
+        // We cast it back to uint8_t since kernargs are actually stored as this: 
+        // https://github.com/ROCm/hipBLASLt/blob/33e633fe2a270dd5c3a8b0e4ed12147f77d32761/tensilelite/Tensile/Source/lib/include/Tensile/KernelArguments.hpp#L227
+        uint8_t* kernargs = static_cast<uint8_t*>(nodeParams.extra[1]);
+        insertAlignKernargSegment(8, kernargs, *((size_t*)nodeParams.extra[3]), &kernelArgsCombinedSize);
       }
     }
   }
 
-  size_t semaphoreSize = sizeof(semaphore_);
-  kernargs_combined_size += semaphoreSize;
-  uint8_t* semaphoreBytePtr = reinterpret_cast<uint8_t*>(&semaphore_);
-  gemmKernelArgs_.insert(gemmKernelArgs_.end(), semaphoreBytePtr, semaphoreBytePtr + semaphoreSize);
-  fusedNodeParams_.extra[1] = malloc(kernargs_combined_size);
-  if (fusedNodeParams_.extra[1] == nullptr) {
-    ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "FusionGroup::generateNode() - HIP error out of memory for allocating extra[1]: kernargs!");
+  // Fused kernel args from HIP only
+  if (fromHIP && !fromASM) {
+    kernelArgs_.push_back(&semaphore_);
+    kernelArgs_.reserve(kernelArgs_.size() + hiddenkernelArgs_.size());
+    kernelArgs_.insert(kernelArgs_.end(), hiddenkernelArgs_.begin(), hiddenkernelArgs_.end());
+    fusedNodeParams_.kernelParams = kernelArgs_.data();
+    fusedNodeParams_.extra = nullptr;
   }
-  fusedNodeParams_.extra[3] = malloc(sizeof(void*));
-  if (fusedNodeParams_.extra[3] == nullptr) {
-    ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "FusionGroup::generateNode() - HIP error out of memory for allocating extra[3]: kernargs_size!");
+
+  // Fused kernel args from either ASM only or Mixed
+  if ((!fromHIP && fromASM) || (fromHIP && fromASM)) {
+    size_t semaphoreSize = sizeof(semaphore_);
+    kernelArgsCombinedSize += semaphoreSize;
+    uint8_t* semaphoreBytePtr = reinterpret_cast<uint8_t*>(&semaphore_);
+    mixedKernelArgs_.insert(mixedKernelArgs_.end(), semaphoreBytePtr, semaphoreBytePtr + semaphoreSize);
+    fusedNodeParams_.extra[1] = malloc(kernelArgsCombinedSize);
+    if (fusedNodeParams_.extra[1] == nullptr) {
+      ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "FusionGroup::generateNode() - HIP error out of memory for allocating extra[1]: kernargs!");
+    }
+    fusedNodeParams_.extra[3] = malloc(sizeof(void*));
+    if (fusedNodeParams_.extra[3] == nullptr) {
+      ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "FusionGroup::generateNode() - HIP error out of memory for allocating extra[3]: kernargs_size!");
+    }
+    *((size_t*)fusedNodeParams_.extra[3]) = kernelArgsCombinedSize;
+    ::memcpy(fusedNodeParams_.extra[1], mixedKernelArgs_.data(), kernelArgsCombinedSize);
+    // For kernels that get launched using hipExtModuleLaunchKernel(), we need kernelParams to be null
+    fusedNodeParams_.kernelParams = nullptr;
+    ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "FusionGroup::generateNode() - Dumping out fusedNodeParams->extra after merging kernargs!");
+    dumpExtra(fusedNodeParams_);
   }
-  *((size_t*)fusedNodeParams_.extra[3]) = kernargs_combined_size;
-  ::memcpy(fusedNodeParams_.extra[1], gemmKernelArgs_.data(), kernargs_combined_size);
-
-  // TODO: In the near future we have to figure out how to mix kernel args coming from `extra` buffer and the `kernelParams` buffer
-  // The commented code below deals with kernargs coming from kernelParams path
-  // kernelArgs_.push_back(&semaphore_);
-  // kernelArgs_.reserve(kernelArgs_.size() + hiddenkernelArgs_.size());
-  // kernelArgs_.insert(kernelArgs_.end(), hiddenkernelArgs_.begin(), hiddenkernelArgs_.end());
-
-  // for hipblaslt gemm kernels that use hipExtModuleLaunchKernel()
-  fusedNodeParams_.kernelParams = nullptr;
-  // fusedNodeParams_.extra = kernelArgs_.data();
-
-  ClPrint(amd::LOG_ERROR, amd::LOG_ALWAYS, "FusionGroup::generateNode() - Dumping out fusedNodeParams->extra after merging kernargs!");
-  dumpExtra(fusedNodeParams_);
 
   hipError_t status = hip::GraphKernelNode::validateKernelParams(&fusedNodeParams_);
   if (hipSuccess != status) {
